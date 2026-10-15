@@ -607,6 +607,10 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
                                                UNCERTAIN (provider log lookup, else user decides)
 ```
 
+`WITHDRAWN` is terminal. A draft version reaches it when the draft is deleted, sent from
+Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-send check
+(below).
+
 - **One dispatch per draft version, for its whole life.** The dispatch document's ID is
   `hash(draftId, draftMessageId)`, created with create-if-absent in the confirming
   transaction.
@@ -684,9 +688,15 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
      edited or deleted. If history has expired, so reconciliation can't be done, or the
      stored bytes are gone, alert rather than guess. A duplicate Sent copy is cosmetic, but
      it's still avoided.
-- **Pre-send check:** at the start of `SENDING`, re-fetch the draft and require
-  `messageId == confirmed messageId`. Otherwise go back to `OFFERED` and re-notify with "Draft
-  changed — review".
+- **Pre-send check:** before committing `SENDING`, re-fetch the draft and require
+  `messageId == confirmed messageId`. If it differs, or the draft is gone, nothing has been
+  stored or submitted yet:
+  - This dispatch moves to the **terminal** `WITHDRAWN`. It's keyed to a draft version that
+    no longer exists, so nothing could ever confirm it again, and it must not sit in a
+    non-terminal state for the sweep to chase.
+  - An edited draft is a **new version**. It's offered afresh, with a "Draft changed —
+    review" notification, and gets its own dispatch (keyed by the new message ID) only when
+    you confirm it.
 - **Undo window:** confirming commits `CONFIRMED` together with `sendAfter` (now +
   `undo_seconds`) and a `confirmation` number. It then creates a Cloud Task with a
   name built from the dispatch's state (`dispatchId-confirmation-scheduleGen`, see below).
@@ -719,7 +729,8 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
   action, or a new tap in a PWA or extension view that has fetched a new token.
 - **Every transition persists its next step.** Each state commit also writes `nextStepAt`,
   so a process can die between the commit and task creation without stranding the
-  dispatch.
+  dispatch. So does every retry decision: a transient error commits a later `nextStepAt`
+  (the backoff) together with the re-enqueue.
 - **Task names include a scheduling generation.** Each Cloud Task is named
   `dispatchId-state-attempt-scheduleGen`.
   - `scheduleGen` is incremented in the same transaction that decides to (re)enqueue.
@@ -728,12 +739,15 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
     retries or is deleted, stalling a `SENT`, `FILING` or `FILED` dispatch, and its
     sendable draft, for a day.
   - **Idempotency comes from the transactional guard, not the name.** Every handler
-    checks the **lifecycle guard** (state, attempt and `confirmation`) and takes the
-    per-dispatch lease before acting.
+    checks the **lifecycle guard** (state, attempt and `confirmation`), checks that the
+    step is **due** (`now ≥ nextStepAt`), and takes the per-dispatch lease before acting.
     - `scheduleGen` exists only to make names unique. It is **not** part of the guard.
     - Any queued task whose lifecycle guard still matches may perform the step, however
-      old its `scheduleGen`. The first to run does the work and moves the state on, and
-      the rest find the state changed and do nothing.
+      old its `scheduleGen`, **once the step is due**. The first to run does the work and
+      moves the state on, and the rest find the state changed and do nothing.
+    - A task that arrives before `nextStepAt` does nothing. So after a transient error has
+      pushed `nextStepAt` out, an older duplicate can't run the step early and skip the
+      backoff; the task enqueued for the new `nextStepAt`, or the sweep, runs it on time.
     - So a backlog in Cloud Tasks can delay a step but never starve it.
 - **Recovery sweep** (Cloud Scheduler, every few minutes, in both modes). It enqueues the
   next step for **any non-terminal dispatch whose `nextStepAt` is more than a minute
@@ -896,7 +910,7 @@ or addresses.
 | Insert fails, or its outcome is unknown (lost response, crash before `FILED`) | API error or a dispatch left in `FILING` | reconcile by `X-Mmail-Dispatch` (thread or history since the recorded `historyId`) before any retry (§4.10); then retry with backoff → `SENT_UNFILED` + alert; mail *was* sent |
 | Copy filed but without `SENT` (Gmail behaviour changed, e.g. at the January cutover) | label read-back after filing | alert: re-run `mmail doctor` and re-pin `sent_strategy`; no automatic second filing |
 | Draft delete fails after a successful send | API error | leftover-draft warning in the notification; retried on every reconcile |
-| Draft edited after confirm | message ID mismatch | send is blocked and re-offered; if after send, draft kept |
+| Draft edited after confirm | message ID mismatch | before send: this dispatch becomes `WITHDRAWN` (terminal) and the edited version is offered afresh, getting its own dispatch when confirmed; after send: draft kept |
 | Repeated tap, lost `/dispatch` response, replayed token | dispatch for `(draftId, draftMessageId)` already exists | returns the existing dispatch and its state; never a second send |
 | Some recipients rejected at `RCPT TO` | rejected set in the transport result | `SENT_PARTIAL`; you're told who and why; "retry rejected only"; never a whole-message resend |
 | Half-written draft looks settled (you paused, or are offline mid-edit) | not armed (§4.3) | notification offers **Review…** only; no one-tap Send |
