@@ -586,7 +586,8 @@ Firestore (Native mode), single user:
 An earlier draft had an optional relay here. It rewrote inbound mail so that Gmail's normal
 Reply would route through a relay address that sends as the domain. It's rejected because it
 puts a rewriter on the inbound critical path, where any fault means mail that silently never
-arrives (OPTIONS.md R7, Option 3).
+arrives (OPTIONS.md R7, Option 3). It also only helps replies, not typed recipients. A
+self-hosted version built to fail open is explored separately in [RELAY.md](RELAY.md).
 
 ## 11. Inventory tool (E0)
 

@@ -266,9 +266,13 @@ webhooks.
 2. Gmail's normal Reply goes to that address.
 3. The relay swaps in `From: me@example.net` and sends it on.
 
-It's the only option with zero extra taps.
+It's the only option with zero extra taps, **but only for Reply and Reply-all.** When you
+type a recipient in To: (or forward to someone new), Gmail delivers straight from Google to
+that person's server, and no relay is in the path. You'd have to type an encoded address
+like `bob=example.org@r.example.net`, or pick it from autocomplete next to the real one. So a
+relay can only ever be an add-on to Option 4 or the Outbox, never a replacement.
 
-**Rejected because it violates R7.** Every incoming email has to pass through the rewriter
+**Rejected for the plan because it violates R7.** Every incoming email has to pass through the rewriter
 before Gmail sees it. A bug, outage, misjudged authentication check or vendor problem means
 mail that silently never arrives. It also:
 
@@ -276,6 +280,10 @@ mail that silently never arrives. It also:
 - breaks sender photos and unsubscribe;
 - fills autocomplete with relay addresses;
 - still leaks `me@gmail.com` whenever you type someone's real address.
+
+**Possible side project:** running our own MX and rewriter (keeping smtp2go for outbound,
+with Forward Email as a fail-open backup MX) could plausibly meet R7. It is written up in
+[RELAY.md](RELAY.md): topologies, fail-open rules, anti-spam, bounces and observability.
 
 ### Option 4 — Gmail Android app: domain identity as an "Other" IMAP account
 
@@ -434,7 +442,7 @@ Notes:
 | 1a Workspace identity | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | none | ~$84/yr | **rejected: splits Google identity (R6)** |
 | 1b Move to Workspace | ✓ | ✓ | ✓ | ✗ | ~ | ✓ | migration | ~$84/yr | **rejected: splits Google identity (R6)** |
 | 2 mmail Outbox | ~ (+1 tap) | ✓ (with ext) | ✓ | ✓ | ✓ | ✓ | medium | ~$0 | medium (our service, API quirks) |
-| 3 Relay (bought or built) | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | none / medium–high | $0–36/yr | **rejected: rewriter on the inbound path (R7)** |
+| 3 Relay (bought or built) | ✓ replies only | ✓ replies only | ✓ | ✓ | ✓ | ✗ | none / high ([RELAY.md](RELAY.md)) | $0–120/yr | **rejected for the plan: rewriter on the inbound path (R7); replies only** |
 | 4 Gmail app IMAP identity | ~ (+2 taps) | ✗ | ~ | ✓ | ~ | ✓ | none | $0 | **unknown until E2** |
 | 5 Extension alone | ✗ | ✓ | ~ | ✓ | ✓ | ✓ | low–medium | ~$0 | medium (Gmail DOM) |
 | 7 FairEmail + Thunderbird | ~ (2nd app) | ~ (desktop) | ✗ | ✓ | ✗ in those apps | ✓ | none | $0–small | low |

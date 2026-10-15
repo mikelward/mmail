@@ -10,5 +10,8 @@ mail through an external provider after Gmail ends third-party "Send as" in Janu
 - [DESIGN.md](DESIGN.md): the design for building our own "mmail Outbox" (compose in Gmail,
   dispatch via smtp2go/Forward Email), its web-only mode, Sent-copy handling, and an
   inventory tool.
+- [RELAY.md](RELAY.md): exploratory side project. Run our own MX and reverse-alias
+  rewriter for zero-tap replies, designed to fail open, with anti-spam, bounces and
+  observability. It helps replies only, so it's not the plan.
 
 Status: design only; no code yet.
