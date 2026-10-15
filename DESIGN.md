@@ -453,7 +453,7 @@ attachments and inline `cid:` images, pass through untouched.**
         resolved. On a rejected-only retry, its recipients move to `dismissedRcpts`.
       - **"Resend anyway"** (`resend-uncertain`, §4.10): it may duplicate. The old attempt
         is retired only once the replacement is definitely going out:
-        1. If filing is still `PENDING`, the pre-send check (§4.10) runs first.
+        1. If no recipient has been accepted yet, the pre-send check (§4.10) runs first.
         2. Only if that passes does one transaction mark the uncertain attempt terminal
            `SUPERSEDED` and commit the new attempt's `SENDING`.
         3. If the check fails, the resend is refused and nothing changes. The old attempt
@@ -613,6 +613,12 @@ Limits:
       The server returns the current state and the notification is updated instead.
       Refreshing a stale notification can never produce a token for content you didn't
       see.
+    - **Refresh is bounded.** It's refused if the token was first issued more than 24
+      hours ago, which matches the notification lifetime. It's also refused if the
+      notification it came from has since been withdrawn, by the daily sweep or because
+      the draft was sent or deleted. The server records each withdrawn notification's
+      token nonce, so a device that was offline and still shows the notification can't
+      refresh it. Either refusal just returns the current state.
     - A daily sweep also withdraws notifications for drafts untouched for over 24 hours.
   - Actions:
     - armed drafts: **Send** (posts the token to `/dispatch` in the background, refreshing
@@ -673,8 +679,9 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
 
 `WITHDRAWN` is terminal. A draft version reaches it when the draft is deleted, sent from
 Gmail or edited before mmail delivers it. The pre-send check (below) catches this at
-`CONFIRMED` and before any resubmission while filing is still `PENDING`. A transient failure before `DATA` parks the attempt in `RETRY_WAIT` and returns to
-`SENDING` when its backoff is due (not drawn). The diagram's `SENT_UNFILED` is delivery
+`CONFIRMED` and before any resubmission while no recipient has been accepted. A transient
+failure before `DATA` parks the attempt in `RETRY_WAIT` and returns to `SENDING` when its
+backoff is due (not drawn). The diagram's `SENT_UNFILED` is delivery
 `SENT` (or `SENT_PARTIAL`) with filing `UNFILED`. Its `DONE_KEPT_DRAFT` is filing `DONE`
 with `draftKept` set.
 
@@ -792,21 +799,25 @@ with `draftKept` set.
      stored bytes are gone, alert rather than guess. A duplicate Sent copy is cosmetic, but
      it's still avoided. Each filing cycle has its own baseline. How a retry after `UNFILED`
      gets a fresh one is described under the recovery sweep below.
-- **Pre-send check:** before **every submission while filing is still `PENDING`**, re-fetch
-  the draft and require `messageId == confirmed messageId`.
-  - **Filing `PENDING`** means nothing is known to have been delivered, so mmail hasn't
-    deleted the draft. You could still have sent it with Gmail or edited it. The check
-    covers:
+- **Pre-send check:** before **every submission while no recipient has been accepted**
+  (`acceptedRcpts` is empty), re-fetch the draft and require
+  `messageId == confirmed messageId`.
+  - **Nothing accepted** means the dispatch hasn't delivered anything. Its draft is still
+    the live copy, which you could have sent with Gmail or edited. The check covers:
     - the first submission (`CONFIRMED` → `SENDING`);
     - its automatic `RETRY_WAIT` → `SENDING` resubmissions;
     - "Retry" after `FAILED`;
     - "Resend anyway" for a first attempt.
-  - **Once filing has started,** mmail deletes the draft itself. Later attempts ("retry
-    rejected only", "Resend anyway" on such a retry) submit the stored MIME without
-    consulting it.
+  - **Once any recipient has been accepted** (`SENT_PARTIAL`, or a resolved `SENT`), the
+    dispatch is committed to delivering that message. Filing runs, and mmail deletes the
+    draft itself. Later attempts ("retry rejected only", "Resend anyway" on such a retry)
+    complete that delivery from the stored MIME without consulting the draft. That holds
+    even in the window before filing starts, so editing the draft then can never withdraw
+    a partly delivered dispatch.
 
   If the message ID differs, or the draft is gone, **nothing is submitted**:
-  - If no attempt can have delivered anything (none is `UNCERTAIN`), the dispatch moves to
+  - If no attempt can have delivered anything (nothing accepted, none `UNCERTAIN`), the
+    dispatch moves to
     the **terminal** `WITHDRAWN`, and its stored MIME, if any, is deleted. It's keyed to a
     draft version that no longer exists, so nothing could ever confirm it again, and it
     must not sit in a non-terminal state for the sweep to chase. A queued retry can
@@ -852,7 +863,9 @@ with `draftKept` set.
     - for `undo`, the `confirmation` generation it cancels;
     - for a retry (including `resend-uncertain`), the attempt number it creates, plus the
       hash of the recipient set for `retry-rejected`;
-    - for `dismiss-rejected`, that recipient-set hash;
+    - for `dismiss-rejected`, that recipient-set hash **and the latest attempt number**.
+      Starting any attempt advances the number, so a dismissal token fetched before a
+      retry is stale afterwards, even if the retry fails and leaves the set unchanged;
     - for `mark-delivered` and `abandon`, the `UNCERTAIN` attempt they resolve;
     - for `retry-filing` and `close`, the current **`filingCycle`**. It's incremented each
       time filing enters `UNFILED`. A token from an earlier `UNFILED` episode no longer
@@ -896,7 +909,7 @@ with `draftKept` set.
     lease**. Only `SENDING` with an expired lease means "may have been accepted"
     (→ `UNCERTAIN`). A parked retry is never mistaken for a crashed submission.
   - When due, `RETRY_WAIT` → `SENDING` (taking the lease again) re-submits the same stored
-    MIME, after the pre-send check (below) if filing is still `PENDING`. Once its retry
+    MIME, after the pre-send check (below) if no recipient has been accepted yet. Once its retry
     budget is spent, the attempt becomes `FAILED`.
 - **Every transition persists its next step.** Each state commit also writes its track's
   `nextStepAt`, so a process can die between the commit and task creation without
