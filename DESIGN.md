@@ -728,8 +728,13 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
     retries or is deleted, stalling a `SENT`, `FILING` or `FILED` dispatch, and its
     sendable draft, for a day.
   - **Idempotency comes from the transactional guard, not the name.** Every handler
-    checks state, attempt, `confirmation` and `scheduleGen` before acting, and takes the
-    per-dispatch lease. A superseded or duplicate task does nothing.
+    checks the **lifecycle guard** (state, attempt and `confirmation`) and takes the
+    per-dispatch lease before acting.
+    - `scheduleGen` exists only to make names unique. It is **not** part of the guard.
+    - Any queued task whose lifecycle guard still matches may perform the step, however
+      old its `scheduleGen`. The first to run does the work and moves the state on, and
+      the rest find the state changed and do nothing.
+    - So a backlog in Cloud Tasks can delay a step but never starve it.
 - **Recovery sweep** (Cloud Scheduler, every few minutes, in both modes). It enqueues the
   next step for **any non-terminal dispatch whose `nextStepAt` is more than a minute
   overdue**:
@@ -749,9 +754,12 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
     `SENT_PARTIAL` dispatch whose filing is already `DONE` is still caught, and can't hold
     its lease forever.
 
-  It also raises the unresolved-dispatch alerts. Each re-enqueue bumps `scheduleGen`, so
-  it never collides with a remembered task name, and the handler's guard keeps the effect
-  idempotent.
+  It also raises the unresolved-dispatch alerts.
+  - Each re-enqueue bumps `scheduleGen`, so it never collides with a remembered task name.
+    The lifecycle guard keeps the effect idempotent.
+  - To avoid piling up duplicates during a backlog, the sweep re-enqueues a step only if
+    the last enqueue for it (`lastEnqueuedAt`) is older than the task's dispatch deadline,
+    or Cloud Tasks reports that task gone.
 
 ## 5. Data model
 
@@ -761,7 +769,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `nextStepAt`, `scheduleGen`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
