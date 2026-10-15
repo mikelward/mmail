@@ -134,9 +134,9 @@ works unchanged.
 The **durable execution parts stay**:
 - **Cloud Tasks** runs the undo delay and each lifecycle step, so nothing depends on the
   HTTP request that started it.
-- **Cloud Scheduler** runs a recovery sweep every few minutes. It resumes `FILING`, retries
-  draft deletion, expires `SENDING` leases into `UNCERTAIN`, and raises the
-  unresolved-dispatch alerts.
+- **Cloud Scheduler** runs the recovery sweep (§4.10) every few minutes. It enqueues
+  overdue `CONFIRMED` dispatches, resumes `FILING`, retries draft deletion, expires
+  `SENDING` leases into `UNCERTAIN`, and raises the unresolved-dispatch alerts.
 
 With min instances at zero, a request that ends or a process that dies never strands a
 dispatch. That's still a much smaller service: Cloud Run, Firestore, Secret Manager, Cloud
@@ -641,7 +641,25 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
 - **Pre-send check:** at the start of `SENDING`, re-fetch the draft and require
   `messageId == confirmed messageId`. Otherwise go back to `OFFERED` and re-notify with "Draft
   changed — review".
-- **Undo window:** a Cloud Task scheduled `undo_seconds` ahead. Undo deletes the task.
+- **Undo window:** confirming commits `CONFIRMED` together with `sendAfter` (now +
+  `undo_seconds`) and a `confirmation` number. It then creates a Cloud Task with a
+  **deterministic name** (`dispatchId-confirmation`), so creating it twice is a no-op.
+  - The task handler acts only if the dispatch is still `CONFIRMED` with the same
+    `confirmation` number. Stale tasks do nothing.
+  - Undo moves the dispatch to `CANCELLED` and deletes the task. If the delete fails, the
+    stale-task check covers it.
+- **Cancelled isn't final.** Nothing was submitted, so a later confirmation of the same
+  draft version (a new tap or click) moves the existing dispatch from `CANCELLED` back to
+  `CONFIRMED` with a fresh undo window and the next `confirmation` number. No draft edit is
+  needed. It's still one dispatch per draft version, so the uniqueness guard holds.
+- **Recovery sweep** (Cloud Scheduler, every few minutes, in both modes):
+  - enqueues any `CONFIRMED` dispatch whose `sendAfter` passed more than a minute ago. That
+    covers a crash or a failed Cloud Tasks call between the confirmation commit and task
+    creation, and the deterministic name keeps it idempotent;
+  - resumes `FILING`;
+  - retries draft deletion;
+  - expires `SENDING` leases into `UNCERTAIN`;
+  - raises the unresolved-dispatch alerts.
 
 ## 5. Data model
 
@@ -651,7 +669,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `state`, `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `sendAfter`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `state`, `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
