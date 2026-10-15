@@ -335,8 +335,12 @@ attachments and inline `cid:` images, pass through untouched.**
     - You're told who didn't get it and why.
     - It is **never retried as a whole**, which would duplicate delivery to the accepted
       recipients. "Retry rejected only" re-submits the same bytes and Message-ID with an
-      envelope of just the rejected addresses, as a child dispatch.
+      envelope of just the rejected addresses, as another attempt of the same dispatch (§4.10).
   - Every recipient rejected (no `DATA` phase) → `FAILED`, and the draft is kept.
+  - **Failures before `DATA`** (connection refused, TLS or auth errors, a temporary 4xx at
+    `MAIL`/`RCPT` for every recipient) are safe to retry, because nothing was accepted. They
+    get a few automatic retries with backoff, then `FAILED`. "Retry" is the next attempt of
+    the same dispatch (§4.10).
   - 5xx before `DATA` → `FAILED`, and the draft is kept.
   - Timeout or connection loss after `DATA` → **`UNCERTAIN`**. Never auto-retry; ask the user,
     because a duplicate is worse than a delay.
@@ -544,15 +548,36 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
     current state, rather than starting a new one. That covers a repeated tap, a lost HTTP
     response, a replayed action token, or the notification and extension both firing.
   - This holds whatever state it's in: `SENDING`, `SENT`, `FILING` or `DONE`.
-  - A new send of the same draft requires an edited draft, which means a new message ID and
-    a new confirmation.
+  - A new *dispatch* of the same draft requires an edited draft, which means a new message
+    ID and a new confirmation. **Retries are *attempts* within the same dispatch**, keyed
+    `(dispatchId, attempt)` so each is idempotent too:
+    - after `FAILED`: nothing was accepted, so "Retry" (or "Retry via secondary provider")
+      starts the next attempt, with no edit needed;
+    - after `SENT_PARTIAL`: "retry rejected only", with an envelope of just those addresses;
+    - after `UNCERTAIN`: **never automatically**. Only your explicit "I've checked, resend
+      anyway", which warns that it may duplicate.
+
+    Every attempt submits the stored outbound MIME (below), so it's the same bytes and the
+    same Message-ID.
+- **Outbound MIME is kept until the dispatch is resolved.** Retries, partial retries and
+  filing recovery all need the exact bytes the recipients got. The draft may be deleted
+  (after `SENT`) or edited by then, and `gmail.compose` + `gmail.metadata` can't read the
+  filed Sent copy's body.
+  - **When:** the outbound message and the sent-copy bytes are written at `SENDING`,
+    *before* submission.
+  - **Where:** a Cloud Storage object with a customer-managed key (Cloud KMS), one per
+    dispatch.
+  - **Deleted:** once the dispatch is `DONE` with no partial retry pending, with a bucket
+    lifecycle rule (e.g. 14 days) as a backstop.
+  - **If it's gone:** recovery **never reconstructs from the current draft**. It alerts
+    instead.
 - **Lease:** each transition is a Firestore transaction. `SENDING` takes a lease on that
   dispatch, so the worker that holds it is the only one that may submit. The lease decides
   *who* may send. It is never used to *retry*: an expired `SENDING` lease becomes
   `UNCERTAIN` (§4.6).
 - **Partial sends:** `SENT_PARTIAL` (§4.6) follows the same path as `SENT` (filing, draft
-  deletion). Its "retry rejected only" child dispatch is keyed by the parent and the rejected
-  set, so it is idempotent in the same way.
+  deletion). Its "retry rejected only" attempt is keyed by the dispatch and the rejected set,
+  so it is idempotent in the same way, and it submits the stored outbound MIME.
 - **Write-ahead:** `SENDING`, with the outbound Message-ID, is committed before submission,
   and `SENT` right after the 2xx. The only window where the outcome is unknown is between
   those two commits, and it always resolves to `UNCERTAIN`. So "never send twice" (G5) holds
@@ -566,8 +591,10 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
      entries since the recorded `historyId` (`history.list`). Both work under
      `gmail.metadata`.
   3. If one is found, move to `FILED` with that message ID. If none is found, retry the
-     insert. If history has expired, so reconciliation can't be done, alert rather than
-     guess. A duplicate Sent copy is cosmetic, but it's still avoided.
+     insert **with the stored sent-copy bytes**, never the current draft, which may have been
+     edited or deleted. If history has expired, so reconciliation can't be done, or the
+     stored bytes are gone, alert rather than guess. A duplicate Sent copy is cosmetic, but
+     it's still avoided.
 - **Pre-send check:** at the start of `SENDING`, re-fetch the draft and require
   `messageId == confirmed messageId`. Otherwise go back to `OFFERED` and re-notify with "Draft
   changed — review".
@@ -581,17 +608,21 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `acceptedRcpts`, `rejectedRcpts`, `parentDispatch` (for "retry rejected only"), `provider`, `providerRef`, `state`, `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `state`, `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
-**No message bodies are stored. Logs carry IDs and states, never subjects or addresses.**
+**Message bodies are stored only as the encrypted outbound MIME of unresolved dispatches**
+(Cloud Storage with a customer-managed key, deleted on resolution, with a lifecycle backstop;
+§4.10). They're never stored in Firestore or logs. Logs carry IDs and states, never subjects
+or addresses.
 
 ## 6. Deployment
 
 - **Default: Google Cloud in `me@gmail.com`'s own project.**
   - Cloud Run (min instances 0), Pub/Sub, Cloud Tasks, Cloud Scheduler (3 jobs: watch renew,
-    reconcile, daily health), Firestore and Secret Manager.
+    reconcile, daily health), Firestore, Secret Manager, and a Cloud Storage bucket with a
+    Cloud KMS key and a lifecycle rule for in-flight outbound MIME.
   - For one user this all sits inside the free tiers (inferred; check the billing report after
     a month).
   - The PWA is served from the service's default `*.run.app` URL. Nothing here should
@@ -662,6 +693,8 @@ Firestore (Native mode), single user:
   - **read any draft in full**, bodies and attachments included. `gmail.compose` allows
     `drafts.get(format=raw)`, which mmail itself uses (§4.5);
   - read the *headers* of every other message (`gmail.metadata`);
+  - read the stored outbound MIME of unresolved dispatches, which is content it could already
+    read as drafts;
   - insert messages into your mailbox;
   - send mail as `me@example.net` (provider credential) or as `me@gmail.com`
     (`gmail.compose`).
@@ -694,7 +727,7 @@ Firestore (Native mode), single user:
 | Watch expired | daily renew; health job alerts if expiry < 2 days | reconcile keeps working meanwhile |
 | `historyId` too old (404) | API error | full resync from `drafts.list` |
 | Refresh token revoked (password change) | token refresh fails | health alert via Web Push; re-auth link in PWA; Gmail's own Send still works |
-| Provider down or rejecting | 4xx/5xx | `FAILED`; draft kept; "Retry" / "Retry via secondary provider" |
+| Provider down or rejecting before `DATA` | connection error, 4xx/5xx at `MAIL`/`RCPT` | automatic retries with backoff, then `FAILED`; draft kept; "Retry" / "Retry via secondary provider" start the next attempt of the same dispatch from the stored MIME, with no edit needed |
 | Timeout after DATA | socket error | `UNCERTAIN`; never auto-retried; user checks recipient/provider log |
 | Process dies mid-submission (the provider may have accepted) | `SENDING` lease expires with no result | `UNCERTAIN`; resolved from the provider's send log by Message-ID if available, else you decide; never resent automatically |
 | Insert fails, or its outcome is unknown (lost response, crash before `FILED`) | API error or a dispatch left in `FILING` | reconcile by `X-Mmail-Dispatch` (thread or history since the recorded `historyId`) before any retry (§4.10); then retry with backoff → `SENT_UNFILED` + alert; mail *was* sent |
