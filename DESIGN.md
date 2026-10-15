@@ -285,8 +285,18 @@ attachments and inline `cid:` images, pass through untouched.**
 4. **Keep** `To`, `Cc`, `Subject`, `Reply-To` (if you set one), `In-Reply-To`, `References`,
    `MIME-Version`, `Content-*` and anything else.
 5. **Reply or new message?** Gmail gives *every* draft a `threadId`, even a brand-new one.
-   The dispatch is classified as a **reply** only if the thread contains a non-draft parent
-   message; otherwise it is **new**.
+   The dispatch is classified as a **reply** only if both of these hold:
+   - the thread contains a non-draft parent message;
+   - the draft's `Subject` matches the thread's subject, once leading `Re:`/`Fwd:`/`Fw:`
+     prefixes and whitespace are stripped and case is ignored. Gmail's threading contract
+     requires matching subjects as well as `threadId` and reply headers.
+
+   Otherwise it is **new for filing purposes**. That includes a forward or reply whose
+   subject you edited. Its outbound threading headers are kept as Gmail wrote them, so
+   recipients still see the relationship, but the sent copy is filed without `threadId`. If
+   an insert *with* `threadId` is still rejected as a threading mismatch, the filer
+   reconciles (§4.10), then re-files without `threadId`, rather than leaving it
+   `SENT_UNFILED`.
    - **New messages** get no threading headers. Their sent copy is filed **without**
      `threadId` (§4.7), so Gmail starts a fresh thread. Gmail's threading rules need a
      parent for `In-Reply-To`/`References`, so filing a new message into its draft thread
