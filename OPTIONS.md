@@ -243,8 +243,11 @@ The build-our-own option; full design in [DESIGN.md](DESIGN.md).
 - **What the backend does:** sends the draft's MIME through smtp2go or forwardemail with
   `From: me@example.net`, inserts the sent copy into the original Gmail thread, and deletes
   the draft.
-- **Day to day, Android:** reply in Gmail → back (the draft is saved) → tap **Send** on the
-  notification. One extra tap; a short undo window is easy to add.
+- **Day to day, Android:** reply in Gmail, Bcc `send@example.net` to mark the draft finished,
+  then back (the draft is saved) and tap **Send** on the notification. Without that marker,
+  the notification only offers **Review**, which opens the draft before sending. That's two
+  taps, so a paused, half-written draft can't go out by accident. There's a short undo
+  window either way.
 - **Day to day, web:** a "Send as ▾" button next to Gmail's Send, plus a guard that catches
   Gmail's own Send on domain threads.
 - **Pros:**
@@ -421,7 +424,7 @@ them, ranked roughly by how close they stay to today.
 
 | # | Workflow | Android | Desktop web | Extra effort per domain email | Built from |
 |---|---|---|---|---|---|
-| B | **Draft then dispatch** | Gmail app → back → tap notification | Gmail web → "Send as" button | +1 tap | 2 (+5a) |
+| B | **Draft then dispatch** | Gmail app → Bcc `send@` → back → tap notification (or back → Review → Send) | Gmail web → "Send as" button | +1 tap and a Bcc, or +2 taps | 2 (+5a) |
 | D | **Two-account Gmail app** | Gmail app, switch From to the IMAP identity | Thunderbird or Forward Email webmail for domain sends | +2 taps on Android; another app on desktop | 4 (+7) |
 | E | **Domain on demand** | Gmail app sends as @gmail.com; FairEmail for the occasional domain send | Gmail web; Thunderbird or webmail for domain sends | 0 normally; switch apps when it matters | 0b + 7 |
 | F | **Gmail address, domain replies** | Gmail app as @gmail.com with Reply-To domain | same | 0 | 0 |
@@ -452,7 +455,7 @@ Notes:
 | 0b Hybrid | ~ | ~ | ~ | ✓ | ✓ | ✓ | none | $0 | low |
 | 1a Workspace identity | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | none | ~$84/yr | **rejected: splits Google identity (R6)** |
 | 1b Move to Workspace | ✓ | ✓ | ✓ | ✗ | ~ | ✓ | migration | ~$84/yr | **rejected: splits Google identity (R6)** |
-| 2 mmail Outbox | ~ (+1 tap) | ✓ (with ext) | ✓ | ✓ | ✓ | ✓ | medium | ~$0 | medium (our service, API quirks) |
+| 2 mmail Outbox | ~ (+1–2 taps) | ✓ (with ext) | ✓ | ✓ | ✓ | ✓ | medium | ~$0 | medium (our service, API quirks) |
 | 3 Relay (bought or built) | ✓ replies only | ✓ replies only | ✓ | ✓ | ✓ | ✗ | none / high ([RELAY.md](RELAY.md)) | $0–120/yr | **rejected for the plan: rewriter on the inbound path (R7); replies only** |
 | 4 Gmail app IMAP identity | ~ (+2 taps) | ✗ | ~ | ✓ | ~ | ✓ | none | $0 | **unknown until E2** |
 | 5 Extension alone | ✗ | ✓ | ~ | ✓ | ✓ | ✓ | low–medium | ~$0 | medium (Gmail DOM) |
