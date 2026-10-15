@@ -135,9 +135,9 @@ The **durable execution parts stay**:
 - **Cloud Tasks** runs the undo delay and each lifecycle step, so nothing depends on the
   HTTP request that started it.
 - **Cloud Scheduler** runs the recovery sweep (§4.10) every few minutes. It enqueues the
-  overdue next step of every non-terminal dispatch (`CONFIRMED`, `SENT`/`SENT_PARTIAL`,
-  `FILING`, `FILED`), expires `SENDING` leases into `UNCERTAIN`, and raises the
-  unresolved-dispatch alerts.
+  overdue next step of every non-terminal dispatch: a `CONFIRMED` submit, and filing steps
+  driven by the filing status (`PENDING`, `FILING`, `FILED`). It also expires `SENDING`
+  leases into `UNCERTAIN` and raises the unresolved-dispatch alerts.
 
 With min instances at zero, a request that ends or a process that dies never strands a
 dispatch. That's still a much smaller service: Cloud Run, Firestore, Secret Manager, Cloud
@@ -734,10 +734,15 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
   next step for **any non-terminal dispatch whose `nextStepAt` is more than a minute
   overdue**:
   - `CONFIRMED` → submit (after `sendAfter`);
-  - `SENT` / `SENT_PARTIAL` → start `FILING`. A delivered message never misses its Sent
-    copy and draft deletion, so a leftover draft can't be sent again by hand;
-  - `FILING` → reconcile, then file;
-  - `FILED` → delete the draft (retried);
+  - filing steps are driven by the **filing status alone**:
+    - **`PENDING`**, when delivery is `SENT`/`SENT_PARTIAL` → start `FILING`, recording
+      `filingHistoryId` once. A delivered message never misses its Sent copy and draft
+      deletion, so a leftover draft can't be sent again by hand.
+    - **`FILING`** → reconcile against the *original* `filingHistoryId`, then file. It is
+      never re-recorded on later runs.
+    - **`FILED`** → delete the draft (retried).
+    - **`DONE`** → nothing. A `SENT_PARTIAL` dispatch stays non-terminal while rejections
+      are outstanding, but that never triggers filing again; only its retry actions remain;
   - **any attempt** that is `SENDING` with an expired lease → that attempt becomes
     `UNCERTAIN`. This is checked per attempt, **before and independently of** the
     dispatch's aggregate delivery and filing status. A crashed rejected-only retry under a
