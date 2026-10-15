@@ -416,15 +416,27 @@ attachments and inline `cid:` images, pass through untouched.**
     - **You can resolve it at any time,** while it's polling or parked, with one of three
       one-time token actions bound to that attempt (§4.10). Each ends its polling in the same
       transaction:
-      - **"It arrived"** (`mark-delivered`): you've confirmed delivery yourself. The
-        attempt resolves as `SENT` for its whole envelope, marked `userConfirmed`. On a
-        first attempt, filing and draft deletion then run as for any `SENT`. On a
-        rejected-only retry, those recipients leave `rejectedRcpts`.
+      - **"It arrived"** (`mark-delivered`): you've confirmed delivery yourself. It only
+        confirms the recipients that may have received the message. **Known `RCPT TO`
+        rejections stay rejected.**
+        - When the connection was lost after `DATA`, the worker survives and records the
+          per-recipient `RCPT` results with the `UNCERTAIN` state. Only the recipients
+          admitted to `DATA` are uncertain. If the worker crashed, nothing was recorded,
+          so the whole envelope is.
+        - The attempt resolves, marked `userConfirmed`, as `SENT` if no recipient was
+          rejected at `RCPT`, or `SENT_PARTIAL` with those rejections and "retry rejected
+          only" if some were.
+        - On a first attempt, filing and draft deletion then run as for any delivered
+          message. On a rejected-only retry, only the confirmed recipients leave
+          `rejectedRcpts`.
       - **"Give up"** (`abandon`): nothing is resent, and the attempt becomes terminal
         `ABANDONED`. On a first attempt, the dispatch's delivery becomes `ABANDONED`: no
         Sent copy is filed, the draft is kept as your only record, and the dispatch is
         resolved. On a rejected-only retry, its recipients move to `dismissedRcpts`.
-      - **"Resend anyway"** (`resend-uncertain`): see §4.10. It may duplicate.
+      - **"Resend anyway"** (`resend-uncertain`, §4.10): in one transaction, the uncertain
+        attempt becomes terminal `SUPERSEDED` and the new attempt is created. The old
+        attempt never blocks resolution, and a late provider record for it is ignored.
+        It may duplicate.
 - **DNS:** unchanged from today's Send-as setup: provider DKIM, and SPF or a custom
   return-path. Once mmail is the only outbound path, consider moving DMARC to `p=quarantine`.
 - **Provider limits:** smtp2go free is 1,000/month and 200/day (25/hour until the domain is
