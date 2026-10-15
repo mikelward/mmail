@@ -346,7 +346,17 @@ attachments and inline `cid:` images, pass through untouched.**
 
   How each derives envelope recipients from `raw` is undocumented, so test Bcc before relying
   on them.
-- **Result handling:**
+- **Result handling.** The outcomes below are **per attempt** (§4.10). The dispatch's
+  delivery status *aggregates* them:
+  - **`FAILED`** only when no attempt has ever had a recipient accept the message.
+  - **Once any recipient has accepted,** a later attempt's failure (pre-`DATA`, auth,
+    connection) is recorded on that attempt only. The dispatch stays **`SENT_PARTIAL`**
+    with its rejected set unchanged, so the warning and "retry rejected only" remain
+    available.
+  - **An `UNCERTAIN` retry attempt** also leaves the dispatch `SENT_PARTIAL`, but blocks
+    further retries to those recipients until that attempt is resolved.
+
+  Per attempt:
   - 2xx with **every** recipient accepted → `SENT`.
   - 2xx with **some** recipients rejected → **`SENT_PARTIAL`**. A `RCPT TO` can fail for one
     address while the rest are accepted and delivered. Nodemailer resolves successfully and
