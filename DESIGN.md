@@ -179,15 +179,22 @@ Storage/KMS, Cloud Tasks and Cloud Scheduler.
 
 ### 4.2 Change feed
 
-- **Watch:** `users.watch` with `labelIds: [DRAFT, SENT]` and `labelFilterBehavior: include`,
-  publishing to a Pub/Sub topic. The topic grants `gmail-api-push@system.gserviceaccount.com`
+- **Watch:** `users.watch` with **no label filter**, publishing to a Pub/Sub topic. A
+  `labelIds` filter names the labels a change must carry, but `DRAFT` and `SENT` never sit on
+  the same message. A deleted draft also no longer carries `DRAFT`. So the watch takes every
+  change, and the history is filtered locally. The topic grants `gmail-api-push@system.gserviceaccount.com`
   the Publisher role.
   - A push subscription delivers to `POST /pubsub` with an OIDC token, which we verify.
   - Cloud Scheduler renews the watch daily. It must happen at least every 7 days; daily is
     what Google recommends (doc).
 - **Push handling:** the notification only carries a new `historyId`.
   1. Call `history.list(startHistoryId=last)` and collect touched message IDs.
-  2. Then call `drafts.list` and diff it against the known `{draftId → messageId}` map.
+     - A `DRAFT` message added, or the deletion of a message we track as a draft, means
+       drafts changed.
+     - A `SENT` message added goes to the accidental-send check (§2.5).
+     - Everything else (ordinary inbound mail, label changes) is ignored.
+  2. Only if drafts changed, call `drafts.list` and diff it against the known
+     `{draftId → messageId}` map.
   3. Every draft edit replaces the draft's message (`messageDeleted` + `messageAdded`), so
      **drafts are tracked by draft ID, never by message ID** (reported).
 - **Reconcile:** Cloud Scheduler runs the same diff every 10 minutes, and the PWA runs it on
@@ -195,7 +202,8 @@ Storage/KMS, Cloud Tasks and Cloud Scheduler.
 - **Lost history:** if `history.list` returns 404 because the history ID is too old, do a
   full resync from `drafts.list`.
 - **Quota:** watch costs 100 units and history/drafts calls cost single-digit units, against
-  a 15k units/min/user limit (doc). One user won't come close. (Google introduced quota tiers
+  a 15k units/min/user limit (doc). The unfiltered watch adds one `history.list` per inbound
+  message. One user still won't come close. (Google introduced quota tiers
   in May 2026; re-check the numbers, but personal volume is far below any threshold.)
 
 ### 4.3 Draft tracker and notification policy
@@ -378,8 +386,18 @@ attachments and inline `cid:` images, pass through untouched.**
     get a few automatic retries with backoff, then `FAILED`. "Retry" is the next attempt of
     the same dispatch (§4.10).
   - 5xx before `DATA` → `FAILED`, and the draft is kept.
-  - Timeout or connection loss after `DATA` → **`UNCERTAIN`**. Never auto-retry; ask the user,
-    because a duplicate is worse than a delay.
+  - **A definitive negative reply after the message body** (to the final `.`, or to the
+    `DATA` command itself) means the server took responsibility for nothing. RFC 5321 §4.2.5
+    forbids delivery after either reply, and the reply covers every recipient admitted to
+    `DATA`.
+    - 4xx → safe to retry, like a transient failure before `DATA` (`RETRY_WAIT`, then
+      `FAILED` once the retries are spent).
+    - 5xx → `FAILED` for those recipients. If none was accepted earlier, the attempt is
+      `FAILED` and the draft is kept.
+    - Neither is ever `UNCERTAIN`.
+  - Timeout or connection loss after `DATA`, with **no reply** to the final `.` →
+    **`UNCERTAIN`**. Never auto-retry; ask the user, because a duplicate is worse than a
+    delay.
   - The process dies mid-submission. The provider may already have answered 2xx, but `SENT`
     was never committed. When the `SENDING` lease expires with no result recorded, recovery
     moves the dispatch to **`UNCERTAIN`**, never back to sending. This works because
@@ -696,9 +714,23 @@ with `draftKept` set.
 - **Lease:** each transition is a Firestore transaction. `SENDING` takes the attempt's
   lease, so the worker that holds it is the only one that may submit. The same
   transaction refuses to start an attempt while another is `SENDING` or `RETRY_WAIT`, so
-  only one attempt is in flight per dispatch. Filing has its own lease (below), so it neither blocks nor is
-  blocked by a retry. The lease decides *who* may send. It is never used to *retry*: an
-  expired `SENDING` lease becomes `UNCERTAIN` (§4.6).
+  only one attempt is in flight per dispatch. Filing has its own lease (below), so it
+  neither blocks nor is blocked by a retry. The lease decides *who* may send. It is never
+  used to *retry*: an expired `SENDING` lease becomes `UNCERTAIN` (§4.6).
+  - **The submission always ends well before the lease can expire.** The SMTP session or
+    API call runs under a hard in-process deadline (e.g. 2 min) that's much shorter than
+    the lease (e.g. 10 min).
+    - At the deadline the worker aborts the connection. If the end-of-data `.` hasn't been
+      sent, the server must discard the message.
+    - The gap between deadline and expiry covers the provider finishing a request that was
+      already fully sent.
+    - A Cloud Run request timeout doesn't stop a handler, so the deadline is enforced in
+      the worker itself.
+    - So by the time the sweep can declare the attempt `UNCERTAIN`, transmission has
+      stopped, and the outcome is already fixed and in the provider's log. No delivery can
+      land after you resolve or resend.
+  - **Writes are fenced by lease ID.** A worker that somehow outlives its lease can't
+    overwrite the `UNCERTAIN` state or your resolution of it.
 - **Partial sends:** `SENT_PARTIAL` (§4.6) runs filing and draft deletion just like `SENT`,
   but its delivery status stays `SENT_PARTIAL` until every rejected recipient has been
   retried successfully or you dismiss them.
@@ -830,7 +862,8 @@ with `draftKept` set.
   and lease. A transition on one track never writes another track's fields, so neither
   can move the other's deadline.
 - **Safe retries wait outside `SENDING`.** A transient failure **before `DATA`**
-  (connection error, 4xx at `MAIL`/`RCPT` for every recipient) means nothing was accepted.
+  (connection error, 4xx at `MAIL`/`RCPT` for every recipient), or a 4xx reply after the
+  message body (§4.6), means nothing was accepted.
   - The attempt commits `RETRY_WAIT` with the backed-off `nextStepAt` and **releases its
     lease**. Only `SENDING` with an expired lease means "may have been accepted"
     (→ `UNCERTAIN`). A parked retry is never mistaken for a crashed submission.
@@ -1029,7 +1062,8 @@ or addresses.
 | `historyId` too old (404) | API error | full resync from `drafts.list` |
 | Refresh token revoked (password change) | token refresh fails | health alert via Web Push; re-auth link in PWA; Gmail's own Send still works |
 | Provider down or rejecting before `DATA` | connection error, 4xx/5xx at `MAIL`/`RCPT` | automatic retries with backoff (attempt parked in `RETRY_WAIT`, lease released), then `FAILED`; draft kept; "Retry" / "Retry via secondary provider" start the next attempt of the same dispatch from the stored MIME, with no edit needed |
-| Timeout after DATA | socket error | `UNCERTAIN`; never auto-retried; provider log polled; you resolve it with "It arrived", "Give up" or "Resend anyway" (§4.6) |
+| Definitive 4xx/5xx reply after the message body | SMTP reply to the final `.` (or to `DATA`) | nothing delivered (RFC 5321 §4.2.5): 4xx → `RETRY_WAIT` and automatic retries; 5xx → `FAILED` for those recipients; never `UNCERTAIN` |
+| Timeout after DATA, no reply to the final `.` | socket error | `UNCERTAIN`; never auto-retried; provider log polled; you resolve it with "It arrived", "Give up" or "Resend anyway" (§4.6) |
 | Process dies mid-submission (the provider may have accepted) | `SENDING` lease expires with no result | `UNCERTAIN`; resolved from the provider's send log only by a record **uniquely attributable to the current attempt** (its `X-Mmail-Attempt` marker or provider tag, never Message-ID alone) that gives per-recipient results for that attempt's whole envelope (→ `SENT` or `SENT_PARTIAL`); otherwise you decide; never resent automatically |
 | Insert fails, or its outcome is unknown (lost response, crash before `FILED`) | API error or a dispatch left in `FILING` | reconcile by `X-Mmail-Dispatch` (thread or history since the recorded `historyId`) before any retry (§4.10); then retry with backoff → filing `UNFILED` (`SENT_UNFILED`) + alert; "Retry filing" reactivates it; mail *was* sent |
 | Copy filed but without `SENT` (Gmail behaviour changed, e.g. at the January cutover) | label read-back after filing | alert: re-run `mmail doctor` and re-pin `sent_strategy`; no automatic second filing |
