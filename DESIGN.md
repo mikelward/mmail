@@ -134,9 +134,10 @@ works unchanged.
 The **durable execution parts stay**:
 - **Cloud Tasks** runs the undo delay and each lifecycle step, so nothing depends on the
   HTTP request that started it.
-- **Cloud Scheduler** runs the recovery sweep (§4.10) every few minutes. It enqueues
-  overdue `CONFIRMED` dispatches, resumes `FILING`, retries draft deletion, expires
-  `SENDING` leases into `UNCERTAIN`, and raises the unresolved-dispatch alerts.
+- **Cloud Scheduler** runs the recovery sweep (§4.10) every few minutes. It enqueues the
+  overdue next step of every non-terminal dispatch (`CONFIRMED`, `SENT`/`SENT_PARTIAL`,
+  `FILING`, `FILED`), expires `SENDING` leases into `UNCERTAIN`, and raises the
+  unresolved-dispatch alerts.
 
 With min instances at zero, a request that ends or a process that dies never strands a
 dispatch. That's still a much smaller service: Cloud Run, Firestore, Secret Manager, Cloud
@@ -652,14 +653,21 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
   draft version (a new tap or click) moves the existing dispatch from `CANCELLED` back to
   `CONFIRMED` with a fresh undo window and the next `confirmation` number. No draft edit is
   needed. It's still one dispatch per draft version, so the uniqueness guard holds.
-- **Recovery sweep** (Cloud Scheduler, every few minutes, in both modes):
-  - enqueues any `CONFIRMED` dispatch whose `sendAfter` passed more than a minute ago. That
-    covers a crash or a failed Cloud Tasks call between the confirmation commit and task
-    creation, and the deterministic name keeps it idempotent;
-  - resumes `FILING`;
-  - retries draft deletion;
-  - expires `SENDING` leases into `UNCERTAIN`;
-  - raises the unresolved-dispatch alerts.
+- **Every transition persists its next step.** Each state commit also writes `nextStepAt`.
+  The Cloud Task for that step has a deterministic name (`dispatchId-state-attempt`), so a
+  process can die between the commit and task creation without stranding the dispatch.
+- **Recovery sweep** (Cloud Scheduler, every few minutes, in both modes). It enqueues the
+  next step for **any non-terminal dispatch whose `nextStepAt` is more than a minute
+  overdue**:
+  - `CONFIRMED` → submit (after `sendAfter`);
+  - `SENT` / `SENT_PARTIAL` → start `FILING`. A delivered message never misses its Sent
+    copy and draft deletion, so a leftover draft can't be sent again by hand;
+  - `FILING` → reconcile, then file;
+  - `FILED` → delete the draft (retried);
+  - `SENDING` with an expired lease → `UNCERTAIN`.
+
+  It also raises the unresolved-dispatch alerts. Deterministic task names keep all of this
+  idempotent.
 
 ## 5. Data model
 
@@ -669,7 +677,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `sendAfter`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `state`, `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `sendAfter`, `nextStepAt`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `state`, `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
@@ -792,7 +800,7 @@ or addresses.
 | Refresh token revoked (password change) | token refresh fails | health alert via Web Push; re-auth link in PWA; Gmail's own Send still works |
 | Provider down or rejecting before `DATA` | connection error, 4xx/5xx at `MAIL`/`RCPT` | automatic retries with backoff, then `FAILED`; draft kept; "Retry" / "Retry via secondary provider" start the next attempt of the same dispatch from the stored MIME, with no edit needed |
 | Timeout after DATA | socket error | `UNCERTAIN`; never auto-retried; user checks recipient/provider log |
-| Process dies mid-submission (the provider may have accepted) | `SENDING` lease expires with no result | `UNCERTAIN`; resolved from the provider's send log by Message-ID only when it gives per-recipient results (→ `SENT` or `SENT_PARTIAL`), else you decide; never resent automatically |
+| Process dies mid-submission (the provider may have accepted) | `SENDING` lease expires with no result | `UNCERTAIN`; resolved from the provider's send log only by a record **uniquely attributable to the current attempt** (its `X-Mmail-Attempt` marker or provider tag, never Message-ID alone) that gives per-recipient results for that attempt's whole envelope (→ `SENT` or `SENT_PARTIAL`); otherwise you decide; never resent automatically |
 | Insert fails, or its outcome is unknown (lost response, crash before `FILED`) | API error or a dispatch left in `FILING` | reconcile by `X-Mmail-Dispatch` (thread or history since the recorded `historyId`) before any retry (§4.10); then retry with backoff → `SENT_UNFILED` + alert; mail *was* sent |
 | Copy filed but without `SENT` (Gmail behaviour changed, e.g. at the January cutover) | label read-back after filing | alert: re-run `mmail doctor` and re-pin `sent_strategy`; no automatic second filing |
 | Draft delete fails after a successful send | API error | leftover-draft warning in the notification; retried on every reconcile |
