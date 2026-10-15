@@ -542,7 +542,7 @@ Limits:
   - The payload holds `draftId`, identity, a recipient summary, the subject, the body's
     first and last lines, and the attachment count. For **armed** drafts only (§4.3), it also
     carries a signed **action token**:
-    `HMAC(key, draftId | draftMessageId | identity | generation | confirmationId | expiry)`,
+    `HMAC(key, action | target | draftId | draftMessageId | identity | generation | confirmationId | expiry)`,
     valid for 15 minutes and usable once (§4.10). Replaying it only ever returns the same
     dispatch (§4.10).
   - **Expired tokens are refreshed on tap.** A notification can sit untouched for longer
@@ -611,8 +611,10 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
 
 `WITHDRAWN` is terminal. A draft version reaches it when the draft is deleted, sent from
 Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-send check
-(below). The diagram's `SENT_UNFILED` is delivery `SENT` (or `SENT_PARTIAL`) with filing
-`UNFILED`. Its `DONE_KEPT_DRAFT` is filing `DONE` with `draftKept` set.
+(below). A transient failure before `DATA` parks the attempt in `RETRY_WAIT` and returns to
+`SENDING` when its backoff is due (not drawn). The diagram's `SENT_UNFILED` is delivery
+`SENT` (or `SENT_PARTIAL`) with filing `UNFILED`. Its `DONE_KEPT_DRAFT` is filing `DONE`
+with `draftKept` set.
 
 - **One dispatch per draft version, for its whole life.** The dispatch document's ID is
   `hash(draftId, draftMessageId)`, created with create-if-absent in the confirming
@@ -656,8 +658,8 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
     instead.
 - **Lease:** each transition is a Firestore transaction. `SENDING` takes the attempt's
   lease, so the worker that holds it is the only one that may submit. The same
-  transaction refuses to start an attempt while another is `SENDING`, so only one attempt
-  is in flight per dispatch. Filing has its own lease (below), so it neither blocks nor is
+  transaction refuses to start an attempt while another is `SENDING` or `RETRY_WAIT`, so
+  only one attempt is in flight per dispatch. Filing has its own lease (below), so it neither blocks nor is
   blocked by a retry. The lease decides *who* may send. It is never used to *retry*: an
   expired `SENDING` lease becomes `UNCERTAIN` (§4.6).
 - **Partial sends:** `SENT_PARTIAL` (§4.6) runs filing and draft deletion just like `SENT`,
@@ -667,8 +669,8 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
     `(dispatchId, attempt n)`, where `n` increments with every retry action. It submits the
     stored outbound MIME to the rejected set.
     - Replays of that *one* action are de-duplicated by its server-issued one-time token
-      (the same generation-bound token model as confirmations). A repeated tap, or a retried
-      request, returns attempt `n` rather than starting another.
+      (the same token model as confirmations, bound to this action and attempt `n`). A
+      repeated tap, or a retried request, returns attempt `n` rather than starting another.
     - After an attempt fails before `DATA`, the next retry action gets attempt `n+1` and
       really submits again.
   - A successful retry updates `acceptedRcpts`/`rejectedRcpts` and the delivery status,
@@ -713,16 +715,25 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
   draft version (a new tap or click) moves the existing dispatch from `CANCELLED` back to
   `CONFIRMED` with a fresh undo window and the next `confirmation` number. No draft edit is
   needed. It's still one dispatch per draft version, so the uniqueness guard holds.
-- **Every confirmation uses a server-issued, generation-bound, one-time token.** Clients
-  never mint their own.
+- **Every confirmation, and every other action on a dispatch, uses a server-issued,
+  generation-bound, one-time token.** Clients never mint their own.
   - Notification actions carry one, bound to the identity the notification shows.
   - The PWA and extension fetch one for the identity currently selected
     (`GET /dispatch/{draftId}/token?identity=…`) when they show the Send button. They fetch
     a new one whenever the dispatch **or the selected identity** changes, so a token is
     only ever minted after the choice is made.
   - Each token binds `draftId`, `draftMessageId`, identity, the current `confirmation`
-    generation, a server nonce and an expiry (§4.8). The server mints one only for a
-    configured identity.
+    generation, a server nonce and an expiry (§4.8).
+  - **Each token is bound to one action and its target.** The action is one of `confirm`,
+    `retry`, `retry-rejected`, `resend-uncertain`, `retry-filing` or `close`. The target is
+    action-specific: for a retry, the attempt number it creates, plus the hash of the
+    recipient set for `retry-rejected`. The server stores the action and target with the
+    nonce, and each endpoint accepts only tokens for its own action and the current
+    target. A mismatch is rejected without consuming the nonce. So when "Retry filing" and
+    "retry rejected only" are both on offer, neither token can authorize the other.
+  - **The server mints a token only for an identity the resolver could produce** (§4.4):
+    a listed identity, or any address at the `catch_all` domain, such as
+    `amazon@example.net`, which uses the default identity's display name.
   - **The identity comes only from the token.** `/dispatch` takes no separate identity
     field. The confirming transition records the token's identity on the dispatch, so a
     reconfirmation after Undo may pick a different one.
@@ -739,14 +750,21 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
   the server issued after the cancellation**: the Undo notification's fresh "Send anyway"
   action, or a new tap in a PWA or extension view that has fetched a new token.
 - **Delivery and filing keep separate clocks.** A dispatch has independent **tracks**:
-  - one **delivery track per attempt** (`CONFIRMED` → `SENDING` → result, including its
-    backoff retries before `DATA`);
+  - one **delivery track per attempt** (`CONFIRMED` → `SENDING` → result, with
+    `RETRY_WAIT` between submissions, below);
   - one **filing track** (`PENDING` → `FILING` → `FILED` → `DONE`).
 
   Under `SENT_PARTIAL` both can be active at once, e.g. a rejected-only retry while filing
   is backing off. So each track has its own `nextStepAt`, `scheduleGen`, `lastEnqueuedAt`
   and lease. A transition on one track never writes another track's fields, so neither
   can move the other's deadline.
+- **Safe retries wait outside `SENDING`.** A transient failure **before `DATA`**
+  (connection error, 4xx at `MAIL`/`RCPT` for every recipient) means nothing was accepted.
+  - The attempt commits `RETRY_WAIT` with the backed-off `nextStepAt` and **releases its
+    lease**. Only `SENDING` with an expired lease means "may have been accepted"
+    (→ `UNCERTAIN`). A parked retry is never mistaken for a crashed submission.
+  - When due, `RETRY_WAIT` → `SENDING` (taking the lease again) re-submits the same stored
+    MIME. Once its retry budget is spent, the attempt becomes `FAILED`.
 - **Every transition persists its next step.** Each state commit also writes its track's
   `nextStepAt`, so a process can die between the commit and task creation without
   stranding the dispatch. So does every retry decision: a transient error commits a later
@@ -775,6 +793,7 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
   next step for **any non-terminal track whose `nextStepAt` is more than a minute
   overdue**:
   - `CONFIRMED` → submit (after `sendAfter`);
+  - `RETRY_WAIT` → submit again;
   - filing steps are driven by the **filing status alone**:
     - **`PENDING`**, when delivery is `SENT`/`SENT_PARTIAL` → start `FILING`, recording
       `filingHistoryId` once. A delivered message never misses its Sent copy and draft
@@ -934,7 +953,7 @@ or addresses.
 | Watch expired | daily renew; health job alerts if expiry < 2 days | reconcile keeps working meanwhile |
 | `historyId` too old (404) | API error | full resync from `drafts.list` |
 | Refresh token revoked (password change) | token refresh fails | health alert via Web Push; re-auth link in PWA; Gmail's own Send still works |
-| Provider down or rejecting before `DATA` | connection error, 4xx/5xx at `MAIL`/`RCPT` | automatic retries with backoff, then `FAILED`; draft kept; "Retry" / "Retry via secondary provider" start the next attempt of the same dispatch from the stored MIME, with no edit needed |
+| Provider down or rejecting before `DATA` | connection error, 4xx/5xx at `MAIL`/`RCPT` | automatic retries with backoff (attempt parked in `RETRY_WAIT`, lease released), then `FAILED`; draft kept; "Retry" / "Retry via secondary provider" start the next attempt of the same dispatch from the stored MIME, with no edit needed |
 | Timeout after DATA | socket error | `UNCERTAIN`; never auto-retried; user checks recipient/provider log |
 | Process dies mid-submission (the provider may have accepted) | `SENDING` lease expires with no result | `UNCERTAIN`; resolved from the provider's send log only by a record **uniquely attributable to the current attempt** (its `X-Mmail-Attempt` marker or provider tag, never Message-ID alone) that gives per-recipient results for that attempt's whole envelope (→ `SENT` or `SENT_PARTIAL`); otherwise you decide; never resent automatically |
 | Insert fails, or its outcome is unknown (lost response, crash before `FILED`) | API error or a dispatch left in `FILING` | reconcile by `X-Mmail-Dispatch` (thread or history since the recorded `historyId`) before any retry (§4.10); then retry with backoff → filing `UNFILED` (`SENT_UNFILED`) + alert; "Retry filing" reactivates it; mail *was* sent |
