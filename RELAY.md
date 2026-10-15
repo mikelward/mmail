@@ -89,8 +89,17 @@ These are the point of the design.
      regional persistent disk, replicated across two zones). It's reattached to a
      replacement VM, which then finishes delivering whatever was in flight.
    - **For a stronger guarantee,** a before-queue proxy (`smtpd_proxy_filter`) writes each
-     raw message to multi-zone object storage *before* Postfix answers `250 OK`. After an
-     unrecoverable loss, the journal is replayed, with delivery de-duplicated by Message-ID.
+     accepted envelope (raw message plus envelope sender and recipients) to multi-zone
+     object storage *before* Postfix answers `250 OK`.
+     - Each entry gets a **server-generated journal ID** (a UUID), stored with the entry and
+       added as an `X-Mmail-Journal-Id` header.
+     - When the Gmail delivery agent gets a success from `messages.import`, it records an
+       **acknowledgement** for that journal ID.
+     - After an unrecoverable loss, replay re-delivers **every entry without an
+       acknowledgement**. It never de-duplicates by `Message-ID`, which senders supply, may
+       omit, and may reuse.
+     - That makes replay at-least-once. A message delivered but not yet acknowledged may
+       arrive twice, which is acceptable, but nothing accepted is ever dropped.
    - **Queues normally drain in seconds,** so the exposed window is small; the canary
      (§4) would notice a stuck queue.
 
