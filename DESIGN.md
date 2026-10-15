@@ -306,7 +306,8 @@ attachments and inline `cid:` images, pass through untouched.**
 7. **Limits:** refuse anything over 25 MB. Gmail already converts large attachments to Drive
    links.
 8. **Outputs:**
-   - the *outbound message*: the headers above plus the body;
+   - the *outbound message*: the headers above plus the body. Each submission attempt adds
+     its own `X-Mmail-Attempt: <dispatchId>/<n>` (§4.6);
    - the *sent copy*: the outbound message plus the original `Bcc` (so you can still see
      whom you Bcc'd) plus `X-Mmail-Dispatch: <dispatchId>`.
 
@@ -350,9 +351,17 @@ attachments and inline `cid:` images, pass through untouched.**
     `SENDING` and the outbound Message-ID are committed *before* the first byte goes to the
     provider, so recovery always knows a submission may have happened.
   - **Resolving `UNCERTAIN`:** if the provider exposes a searchable send log (smtp2go's
-    activity search, Forward Email's emails API; untested), recovery looks up our Message-ID.
-    - **A positive record with per-recipient results for every envelope recipient** resolves
-      it automatically:
+    activity search, Forward Email's emails API; untested), recovery looks up the **current
+    attempt's marker**, not just the Message-ID. Retries reuse the Message-ID (§4.10), so a
+    Message-ID match can belong to an earlier attempt.
+    - Each attempt carries `X-Mmail-Attempt: <dispatchId>/<n>`, or the provider's own
+      tag/metadata field where it has one. Its provider reference is recorded the moment the
+      submission returns.
+    - **Only a record carrying the current attempt's marker counts.** Records that can't be
+      uniquely attributed to the current attempt, such as an earlier attempt's result for
+      the same recipient, are ignored, and the attempt stays `UNCERTAIN`.
+    - **A positive, attributable record with per-recipient results for every recipient in
+      that attempt's envelope** resolves it automatically:
       - all accepted → `SENT`;
       - some rejected → `SENT_PARTIAL`, with the accepted and rejected sets, the warning and
         "retry rejected only".
@@ -564,8 +573,9 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
     - after `UNCERTAIN`: **never automatically**. Only your explicit "I've checked, resend
       anyway", which warns that it may duplicate.
 
-    Every attempt submits the stored outbound MIME (below), so it's the same bytes and the
-    same Message-ID.
+    Every attempt submits the stored outbound MIME (below), with the same body and the same
+    Message-ID. Only the `X-Mmail-Attempt` header differs, so the provider log can tell
+    attempts apart (§4.6). The lease allows one in-flight attempt per dispatch at a time.
 - **Outbound MIME is kept until the dispatch is resolved.** Retries, partial retries and
   filing recovery all need the exact bytes the recipients got. The draft may be deleted
   (after `SENT`) or edited by then, and `gmail.compose` + `gmail.metadata` can't read the
