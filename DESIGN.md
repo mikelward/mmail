@@ -372,7 +372,9 @@ Firestore (Native mode), single user:
     reconcile, daily health), Firestore and Secret Manager.
   - For one user this all sits inside the free tiers (inferred; check the billing report after
     a month).
-  - A custom domain such as `mmail.example.net` serves the PWA.
+  - The PWA is served from the service's default `*.run.app` URL. Nothing here should
+    register `example.net` with Google as an organisation (Workspace, Cloud Identity); see
+    OPTIONS.md R6.
 - **Stack: TypeScript end to end**, so the server, PWA and extension share `core` (MIME,
   identity, types).
   - `googleapis`
@@ -551,7 +553,7 @@ still exists.
 
 | Milestone | Target | Contents |
 |---|---|---|
-| **M0** | 2026-10-31 | E0 inventory; E1 Workspace test; E2 Gmail-app IMAP test; E3 API spikes. **Decide**: if E1 passes, stop here and keep this doc as contingency. |
+| **M0** | 2026-10-31 | E0 inventory; E2 Gmail-app IMAP test (the interim Android path); E3 API spikes to check assumptions A1–A7. |
 | **M1** | 2026-11-21 | Prototype: CLI `mmail dispatch <draftId>` + `core` transform + filer, run locally against real drafts; ntfy notification from a polling loop. Verifies threading, sent copy, DKIM. |
 | **M2** | 2026-12-12 | Cloud Run + Pub/Sub + Firestore + Cloud Tasks; PWA with Web Push actions; identity resolver; undo; accidental-send heads-up; health alerts. Daily driver on Android. |
 | **M3** | 2027-01-09 | Gmail web extension (button + guard). Until then, desktop uses notifications or the PWA. |
