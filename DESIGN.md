@@ -651,10 +651,12 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
       backstop for failed deletes, so it can never remove bytes an open dispatch still needs.
   - **If it's gone:** recovery **never reconstructs from the current draft**. It alerts
     instead.
-- **Lease:** each transition is a Firestore transaction. `SENDING` takes a lease on that
-  dispatch, so the worker that holds it is the only one that may submit. The lease decides
-  *who* may send. It is never used to *retry*: an expired `SENDING` lease becomes
-  `UNCERTAIN` (§4.6).
+- **Lease:** each transition is a Firestore transaction. `SENDING` takes the attempt's
+  lease, so the worker that holds it is the only one that may submit. The same
+  transaction refuses to start an attempt while another is `SENDING`, so only one attempt
+  is in flight per dispatch. Filing has its own lease (below), so it neither blocks nor is
+  blocked by a retry. The lease decides *who* may send. It is never used to *retry*: an
+  expired `SENDING` lease becomes `UNCERTAIN` (§4.6).
 - **Partial sends:** `SENT_PARTIAL` (§4.6) runs filing and draft deletion just like `SENT`,
   but its delivery status stays `SENT_PARTIAL` until every rejected recipient has been
   retried successfully or you dismiss them.
@@ -698,8 +700,8 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
     review" notification, and gets its own dispatch (keyed by the new message ID) only when
     you confirm it.
 - **Undo window:** confirming commits `CONFIRMED` together with `sendAfter` (now +
-  `undo_seconds`) and a `confirmation` number. It then creates a Cloud Task with a
-  name built from the dispatch's state (`dispatchId-confirmation-scheduleGen`, see below).
+  `undo_seconds`) and a `confirmation` number. It then creates a Cloud Task for the
+  attempt, named as described below.
   - The task handler acts only if the dispatch is still `CONFIRMED` with the same
     `confirmation` number. Stale tasks do nothing.
   - Undo moves the dispatch to `CANCELLED` and deletes the task. If the delete fails, the
@@ -727,20 +729,31 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
   Undo increments the generation. So **reconfirming a `CANCELLED` dispatch needs a token
   the server issued after the cancellation**: the Undo notification's fresh "Send anyway"
   action, or a new tap in a PWA or extension view that has fetched a new token.
-- **Every transition persists its next step.** Each state commit also writes `nextStepAt`,
-  so a process can die between the commit and task creation without stranding the
-  dispatch. So does every retry decision: a transient error commits a later `nextStepAt`
-  (the backoff) together with the re-enqueue.
+- **Delivery and filing keep separate clocks.** A dispatch has independent **tracks**:
+  - one **delivery track per attempt** (`CONFIRMED` → `SENDING` → result, including its
+    backoff retries before `DATA`);
+  - one **filing track** (`PENDING` → `FILING` → `FILED` → `DONE`).
+
+  Under `SENT_PARTIAL` both can be active at once, e.g. a rejected-only retry while filing
+  is backing off. So each track has its own `nextStepAt`, `scheduleGen`, `lastEnqueuedAt`
+  and lease. A transition on one track never writes another track's fields, so neither
+  can move the other's deadline.
+- **Every transition persists its next step.** Each state commit also writes its track's
+  `nextStepAt`, so a process can die between the commit and task creation without
+  stranding the dispatch. So does every retry decision: a transient error commits a later
+  `nextStepAt` for that track (the backoff) together with the re-enqueue.
 - **Task names include a scheduling generation.** Each Cloud Task is named
-  `dispatchId-state-attempt-scheduleGen`.
-  - `scheduleGen` is incremented in the same transaction that decides to (re)enqueue.
+  `dispatchId-track-state-scheduleGen`, where the track is `attempt-n` or `filing`.
+  - The track's `scheduleGen` is incremented in the same transaction that decides to
+    (re)enqueue.
   - Cloud Tasks refuses to reuse a deleted or completed task's name for up to ~24 hours.
     A fixed name could therefore leave a re-enqueue blocked after a task exhausts its
     retries or is deleted, stalling a `SENT`, `FILING` or `FILED` dispatch, and its
     sendable draft, for a day.
   - **Idempotency comes from the transactional guard, not the name.** Every handler
-    checks the **lifecycle guard** (state, attempt and `confirmation`), checks that the
-    step is **due** (`now ≥ nextStepAt`), and takes the per-dispatch lease before acting.
+    checks its track's **lifecycle guard** (for an attempt: its state, attempt number and
+    `confirmation`; for filing: the filing status), checks that the step is **due**
+    (`now ≥` the track's `nextStepAt`), and takes the track's lease before acting.
     - `scheduleGen` exists only to make names unique. It is **not** part of the guard.
     - Any queued task whose lifecycle guard still matches may perform the step, however
       old its `scheduleGen`, **once the step is due**. The first to run does the work and
@@ -750,7 +763,7 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
       backoff; the task enqueued for the new `nextStepAt`, or the sweep, runs it on time.
     - So a backlog in Cloud Tasks can delay a step but never starve it.
 - **Recovery sweep** (Cloud Scheduler, every few minutes, in both modes). It enqueues the
-  next step for **any non-terminal dispatch whose `nextStepAt` is more than a minute
+  next step for **any non-terminal track whose `nextStepAt` is more than a minute
   overdue**:
   - `CONFIRMED` → submit (after `sendAfter`);
   - filing steps are driven by the **filing status alone**:
@@ -769,10 +782,10 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
     its lease forever.
 
   It also raises the unresolved-dispatch alerts.
-  - Each re-enqueue bumps `scheduleGen`, so it never collides with a remembered task name.
-    The lifecycle guard keeps the effect idempotent.
+  - Each re-enqueue bumps that track's `scheduleGen`, so it never collides with a
+    remembered task name. The lifecycle guard keeps the effect idempotent.
   - To avoid piling up duplicates during a backlog, the sweep re-enqueues a step only if
-    the last enqueue for it (`lastEnqueuedAt`) is older than the task's dispatch deadline,
+    the track's last enqueue (`lastEnqueuedAt`) is older than the task's dispatch deadline,
     or Cloud Tasks reports that task gone.
 
 ## 5. Data model
@@ -783,7 +796,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `attempt` (per attempt: envelope, result, and its track's `nextStepAt`, `scheduleGen`, `lastEnqueuedAt` and lease), `filingTrack` (`nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, lease), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
