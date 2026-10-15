@@ -127,10 +127,20 @@ push service, which carries only an encrypted, minimal payload.
 
 **Web-only mode.** If E2 shows the Gmail Android app can send as the domain by itself
 (OPTIONS.md Option 4), mmail only has to serve Gmail web. Then the change feed (§4.2), the
-draft tracker and notifications (§4.3, §4.8) and Pub/Sub, Cloud Tasks and Web Push all go
-away. The extension calls `/dispatch` with a draft ID, and everything from the identity
-resolver to the Sent copy works unchanged. That's a much smaller service: Cloud Run, Firestore
-and Secret Manager.
+draft tracker and notifications (§4.3, §4.8), Pub/Sub and Web Push all go away. The extension
+calls `/dispatch` with a draft ID, and everything from the identity resolver to the Sent copy
+works unchanged.
+
+The **durable execution parts stay**:
+- **Cloud Tasks** runs the undo delay and each lifecycle step, so nothing depends on the
+  HTTP request that started it.
+- **Cloud Scheduler** runs a recovery sweep every few minutes. It resumes `FILING`, retries
+  draft deletion, expires `SENDING` leases into `UNCERTAIN`, and raises the
+  unresolved-dispatch alerts.
+
+With min instances at zero, a request that ends or a process that dies never strands a
+dispatch. That's still a much smaller service: Cloud Run, Firestore, Secret Manager, Cloud
+Storage/KMS, Cloud Tasks and Cloud Scheduler.
 
 ## 4. Components
 
