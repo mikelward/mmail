@@ -542,7 +542,8 @@ Limits:
   - The payload holds `draftId`, identity, a recipient summary, the subject, the body's
     first and last lines, and the attachment count. For **armed** drafts only (§4.3), it also
     carries a signed **action token**:
-    `HMAC(key, draftId | draftMessageId | identity | expiry)`, valid for 15 minutes. Replaying
+    `HMAC(key, draftId | draftMessageId | identity | generation | confirmationId | expiry)`,
+    valid for 15 minutes and usable once (§4.10). Replaying
     it only ever returns the same dispatch (§4.10).
   - Actions:
     - armed drafts: **Send** (posts the token to `/dispatch` in the background) and
@@ -682,6 +683,21 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
   draft version (a new tap or click) moves the existing dispatch from `CANCELLED` back to
   `CONFIRMED` with a fresh undo window and the next `confirmation` number. No draft edit is
   needed. It's still one dispatch per draft version, so the uniqueness guard holds.
+- **Every confirmation is one-time.** Each one carries a `confirmationId` (a random
+  nonce), which the server records as consumed on the dispatch. The nonce comes from one of
+  two places:
+  - the server mints it into each notification action token;
+  - the PWA or extension generates it at the moment you tap or click.
+
+  Rules:
+  - A request whose `confirmationId` is already consumed (a delayed duplicate, a retried
+    HTTP call, a replayed token) **only returns the dispatch's current state**. It never
+    changes it.
+  - Each token is also bound to the `confirmation` generation it was issued for.
+    **Reconfirming a `CANCELLED` dispatch needs a nonce minted *after* the cancellation:**
+    the Undo notification offers a fresh "Send anyway" token for the next generation, or
+    you tap again in the PWA or extension. So a stale request from before Undo can never
+    reverse it.
 - **Every transition persists its next step.** Each state commit also writes `nextStepAt`.
   The Cloud Task for that step has a deterministic name (`dispatchId-state-attempt`), so a
   process can die between the commit and task creation without stranding the dispatch.
@@ -710,7 +726,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `sendAfter`, `nextStepAt`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `nextStepAt`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
