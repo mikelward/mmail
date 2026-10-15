@@ -264,9 +264,11 @@ trust_settle: false           # true: a 60 s settle counts as armed (risky)
 Resolution order:
 
 1. **Explicit choice**: from the PWA, the extension, or the action token.
-2. **Thread continuity**: walk the thread newest-first (`threads.get format=metadata`, headers
-   only).
-   - If one of *our* earlier messages was `From:` a domain identity, use that identity.
+2. **Thread continuity**: walk the thread newest-first (`threads.get format=metadata`, with
+   `metadataHeaders` including `From`, `To`, `Cc`, `Delivered-To` and `X-Mmail-Sent-As`).
+   - If one of *our* earlier messages names a domain identity, use that identity. That means
+     either `From:` a domain identity, or carrying `X-Mmail-Sent-As` because it was filed
+     under strategy S4 (§4.7), where the archived `From` is `me@gmail.com`.
    - Otherwise take the first address in `To`/`Cc`/`Delivered-To` of inbound messages that
      matches an identity or the catch-all domain. With catch-all, that's the exact address the
      sender used, e.g. `amazon@example.net`.
@@ -298,9 +300,11 @@ attachments and inline `cid:` images, pass through untouched.**
 5. **Reply or new message?** Gmail gives *every* draft a `threadId`, even a brand-new one.
    The dispatch is classified as a **reply** only if both of these hold:
    - the thread contains a non-draft parent message;
-   - the draft's `Subject` matches the thread's subject, once leading `Re:`/`Fwd:`/`Fw:`
-     prefixes and whitespace are stripped and case is ignored. Gmail's threading contract
-     requires matching subjects as well as `threadId` and reply headers.
+   - the draft's `Subject` matches the thread's subject, once leading **`Re:`** prefixes and
+     whitespace are stripped and case is ignored. **`Fwd:`/`Fw:` are *not* stripped**, so
+     a Gmail forward (`Fwd: Original`) never matches its source thread and is always new
+     for filing. Gmail's threading contract requires matching subjects as well as
+     `threadId` and reply headers.
 
    Otherwise it is **new for filing purposes**. That includes a forward or reply whose
    subject you edited. Its outbound threading headers are kept as Gmail wrote them, so
