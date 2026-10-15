@@ -325,7 +325,18 @@ attachments and inline `cid:` images, pass through untouched.**
   How each derives envelope recipients from `raw` is undocumented, so test Bcc before relying
   on them.
 - **Result handling:**
-  - 2xx → `SENT`.
+  - 2xx with **every** recipient accepted → `SENT`.
+  - 2xx with **some** recipients rejected → **`SENT_PARTIAL`**. A `RCPT TO` can fail for one
+    address while the rest are accepted and delivered. Nodemailer resolves successfully and
+    lists the failures in `info.rejected`; the HTTP APIs report them per recipient.
+    - The accepted and rejected sets are recorded. The dispatch files and cleans up like
+      `SENT`.
+    - The sent copy gets an `X-Mmail-Rejected` header and an `mmail/partial` label.
+    - You're told who didn't get it and why.
+    - It is **never retried as a whole**, which would duplicate delivery to the accepted
+      recipients. "Retry rejected only" re-submits the same bytes and Message-ID with an
+      envelope of just the rejected addresses, as a child dispatch.
+  - Every recipient rejected (no `DATA` phase) → `FAILED`, and the draft is kept.
   - 5xx before `DATA` → `FAILED`, and the draft is kept.
   - Timeout or connection loss after `DATA` → **`UNCERTAIN`**. Never auto-retry; ask the user,
     because a duplicate is worse than a delay.
@@ -476,7 +487,8 @@ Limits:
   - The payload holds `draftId`, identity, a recipient summary, the subject, the body's
     first and last lines, and the attachment count. For **armed** drafts only (§4.3), it also
     carries a signed **action token**:
-    `HMAC(key, draftId | draftMessageId | identity | expiry)`, valid for 15 minutes.
+    `HMAC(key, draftId | draftMessageId | identity | expiry)`, valid for 15 minutes. Replaying
+    it only ever returns the same dispatch (§4.10).
   - Actions:
     - armed drafts: **Send** (posts the token to `/dispatch` in the background) and
       **Review…** (opens the PWA);
@@ -525,10 +537,22 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
                                                UNCERTAIN (provider log lookup, else user decides)
 ```
 
-- **Lease:** each transition is a Firestore transaction. `SENDING` takes a lease keyed by
-  `draftId`, so two taps (notification plus extension) can't both send. The lease decides
+- **One dispatch per draft version, for its whole life.** The dispatch document's ID is
+  `hash(draftId, draftMessageId)`, created with create-if-absent in the confirming
+  transaction.
+  - Every later `/dispatch` for that version returns the *existing* dispatch and its
+    current state, rather than starting a new one. That covers a repeated tap, a lost HTTP
+    response, a replayed action token, or the notification and extension both firing.
+  - This holds whatever state it's in: `SENDING`, `SENT`, `FILING` or `DONE`.
+  - A new send of the same draft requires an edited draft, which means a new message ID and
+    a new confirmation.
+- **Lease:** each transition is a Firestore transaction. `SENDING` takes a lease on that
+  dispatch, so the worker that holds it is the only one that may submit. The lease decides
   *who* may send. It is never used to *retry*: an expired `SENDING` lease becomes
   `UNCERTAIN` (§4.6).
+- **Partial sends:** `SENT_PARTIAL` (§4.6) follows the same path as `SENT` (filing, draft
+  deletion). Its "retry rejected only" child dispatch is keyed by the parent and the rejected
+  set, so it is idempotent in the same way.
 - **Write-ahead:** `SENDING`, with the outbound Message-ID, is committed before submission,
   and `SENT` right after the 2xx. The only window where the outcome is unknown is between
   those two commits, and it always resolves to `UNCERTAIN`. So "never send twice" (G5) holds
@@ -557,7 +581,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{id}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `rcptCount`, `provider`, `providerRef`, `state`, `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `acceptedRcpts`, `rejectedRcpts`, `parentDispatch` (for "retry rejected only"), `provider`, `providerRef`, `state`, `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
@@ -623,6 +647,10 @@ Firestore (Native mode), single user:
   - kill the server after the provider's 2xx but before `SENT` is committed, and confirm the
     dispatch ends in `UNCERTAIN` (or is resolved from the provider log), never resent;
   - edit the draft during the undo window;
+  - replay the same action token, and tap Send twice, both after the first dispatch has
+    reached `SENT`. Confirm both return the existing dispatch and nothing is resubmitted;
+  - send to a mix of valid and rejected recipients. Confirm `SENT_PARTIAL` with the right
+    accepted/rejected sets, and that "retry rejected only" reaches just those addresses;
   - drop Pub/Sub messages and confirm reconcile catches up.
 
 ## 8. Security and privacy
@@ -647,7 +675,8 @@ Firestore (Native mode), single user:
     static PWA.
 - **The endpoint can only send existing drafts.** `/dispatch` takes a draft ID, never message
   content. Combined with the HMAC action token and session auth, a stolen notification token
-  can only send *that* draft version, as *that* identity, within 15 minutes.
+  can only send *that* draft version, as *that* identity, within 15 minutes, and at most once
+  (§4.10).
 - **Limits:** a rate limit (e.g. 30 dispatches/hour, 200/day) and a kill switch (a config
   flag, checked on every dispatch).
 - **Provider credential:** a dedicated smtp2go/Forward Email credential for mmail, separate
@@ -672,6 +701,8 @@ Firestore (Native mode), single user:
 | Copy filed but without `SENT` (Gmail behaviour changed, e.g. at the January cutover) | label read-back after filing | alert: re-run `mmail doctor` and re-pin `sent_strategy`; no automatic second filing |
 | Draft delete fails after a successful send | API error | leftover-draft warning in the notification; retried on every reconcile |
 | Draft edited after confirm | message ID mismatch | send is blocked and re-offered; if after send, draft kept |
+| Repeated tap, lost `/dispatch` response, replayed token | dispatch for `(draftId, draftMessageId)` already exists | returns the existing dispatch and its state; never a second send |
+| Some recipients rejected at `RCPT TO` | rejected set in the transport result | `SENT_PARTIAL`; you're told who and why; "retry rejected only"; never a whole-message resend |
 | Half-written draft looks settled (you paused, or are offline mid-edit) | not armed (§4.3) | notification offers **Review…** only; no one-tap Send |
 | Gmail app re-uploads a stale offline draft after we deleted it | the same draft content reappears | offered again with a "looks already sent" warning |
 | Gmail Send pressed on a domain thread | `SENT` from `me@gmail.com` in a domain-resolved thread | heads-up push (Android); prevented by guard (web) |
