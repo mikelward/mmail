@@ -393,6 +393,22 @@ Turn on IMAP storage at Forward Email ($3/mo for 10 GB) and add `me@example.net`
 | Proton, Zoho, iCloud+, Purelymail, Migadu, MXroute | $10/yr–$5/mo | Viable stores. All fail R1/R5 the same way. Proton has no IMAP on Android, so it can't be added to the Gmail app at all. |
 | Microsoft 365 custom domain | — | No new custom domains since Nov 2023. |
 
+### Cross-cutting: the Sent folder
+
+Every path except Gmail's own Send has to get the copy into Gmail itself. `SENT` is a
+system label that can only be set when a message is created, never added later, so how each
+option files its copy matters. Several Gmail features depend on it: the Sent view, threading
+of replies, collapsing your own list echoes, and reply nudges.
+
+| Option | Who files the copy | Lands in Gmail's Sent? | Matches what recipients got? |
+|---|---|---|---|
+| 0 / 0b @gmail.com | Gmail | ✓ | ✓ |
+| 2 mmail Outbox | mmail, at send time | ✓ if one of the strategies in [DESIGN.md §4.7](DESIGN.md#47-sent-copies-special-handling) works (E3b) | ✓, or From shows `me@gmail.com` under the fallback |
+| 3 Relay | Gmail | ✓ | ✗ shows From `me@gmail.com`, To relay addresses |
+| 4 Gmail app IMAP identity | the app, via IMAP APPEND | maybe: it may create a "Sent" user label instead (E2) | ✓ |
+| 7 FairEmail / Thunderbird | the client, via IMAP APPEND | ✓ once pointed at `[Gmail]/Sent Mail` | ✓ |
+| 9 Domain mailbox at provider | the provider | ✗ only the provider's Sent, unless synced | ✓ |
+
 ## 4. Alternative workflows
 
 The options above are building blocks. These are complete day-to-day workflows built from
@@ -484,15 +500,16 @@ trusted with the primary address.
 | **E0** | Inventory of domain sending | Google Takeout → Mail → only the *Sent* label (mbox), then a local script (no OAuth needed). Alternatively Gmail search `in:sent from:(*@example.net)`. Count messages and recipients per domain over 1/3/10 years; flag helpdesk domains (zendesk.com, freshdesk.com, helpscoutapp.com, service-now.com, atlassian.net…), list traffic (List-Id on received mail) and ingest addresses. | A CSV of "who knows me only as @example.net" and "who checks my sender address". |
 | ~~E1~~ | ~~Consumer → Workspace Send-as~~ | Dropped: Option 1 is rejected (R6). Don't verify the domain with Workspace even for a trial. | — |
 | **E2** | Gmail app IMAP identity | On Android, set up as in Option 4. Reply to a thread in the Google account, switch From, Send. | The app accepts `imap.gmail.com`. The reply is delivered from `me@example.net` with DKIM pass. The sent copy shows in the *same Gmail thread* and in Gmail's Sent (or at least in All Mail under a "Sent" label). |
-| **E3** | Gmail API behaviours (for Option 2) | With a throwaway OAuth client: (a) `drafts.get format=raw` on a reply drafted in the Android app — does it carry In-Reply-To/References? (b) `messages.insert` with `labelIds:[SENT]`, `threadId`, and `From: me@example.net` — does it land in Sent and thread? (c) `watch` with `labelIds:[DRAFT]` — latency after leaving compose on Android; how often web autosave fires. (d) Does smtp2go keep our Message-ID? (e) Does `messages.send` rewrite a non-alias From? | (a)–(d) behave as DESIGN.md assumes; any deviation is noted there. |
+| **E3** | Gmail API behaviours (for Option 2) | With a throwaway OAuth client: (a) `drafts.get format=raw` on a reply drafted in the Android app — does it carry In-Reply-To/References? (b) the Sent filing strategies S1–S5 in DESIGN.md §4.7 (`mmail doctor`): which ones give `SENT`, thread, and show as "me"? Run now and again after the January cutover. (c) `watch` with `labelIds:[DRAFT]` — latency after leaving compose on Android; how often web autosave fires. (d) Does smtp2go keep our Message-ID? (e) Does `messages.send` rewrite a non-alias From? | (a)–(d) behave as DESIGN.md assumes; any deviation is noted there. |
 | **E4** | Reverse-alias trial (optional) | addy.io Pro on a subdomain such as `r.example.net`, or on a secondary address; live with it for two weeks. | Spam leakage, Gmail rendering and autocomplete pollution are tolerable. |
 
 ## 8. Open questions
 
 1. Will the `Reply-To` setting on `me@gmail.com` survive January 2027 (Option 0, workflow F)?
 2. After January, will Gmail still recognise `me@example.net` as "me" in thread display and
-   in the "to me" search operators once it is no longer a Send-as address? (Cosmetic; affects
-   Option 2's sent copies.) The alternate email on the Google account (R6) may be enough.
+   in the "to me" search operators once it is no longer a Send-as address? Will copies we file
+   still get `SENT`? This affects Option 2's sent copies; see DESIGN.md §4.7. The alternate
+   email on the Google account (R6) may be enough.
 3. Will the Gmail Android app keep allowing an "Other" IMAP account that points at
    `imap.gmail.com`? (E2; Google could close this.)
 4. App passwords: still offered but "not recommended". If they disappear, Option 4 breaks;
