@@ -951,6 +951,6 @@ Interim fallback for any slippage: FairEmail on Android and Thunderbird on deskt
 | A3 | At least one of S1–S3 (§4.7) files a `SENT` copy with the true From that threads and shows as "me". | S4 (Gmail From in the archive); S5 as a last resort. |
 | A4 | The provider preserves our `Message-ID`. | Read back the provider's ID and use it for the sent copy; or switch provider. |
 | A5 | `gmail.compose` + `gmail.metadata` together allow `drafts.get(raw)` and `threads.get(metadata)`. | Use `gmail.modify` instead (broader). |
-| A6 | The InboxSDK draft ID equals the Gmail API draft ID. | Look the draft up by thread + recipients + recency. |
+| A6 | The InboxSDK draft ID equals the Gmail API draft ID. | Look the draft up by thread, recipients, subject and a save-time window, but **only dispatch if exactly one draft matches**. With zero or several candidates (e.g. two compose windows in the same thread), refuse, and ask you to send from the PWA's Review screen, where the draft is chosen explicitly. Never guess. |
 | A7 | After January 2027 Gmail still renders our inserted sent copies sensibly even though `me@example.net` is no longer a Send-as alias. | Re-run `mmail doctor`; switch to S4 if "me" or `SENT` breaks. |
 | A8 | Gmail collapses inbound echoes (Cc to yourself, list copies) of a message whose `SENT` copy exists with the same Message-ID. | Echoes show as new mail; mmail flags them. |
