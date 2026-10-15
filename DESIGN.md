@@ -782,7 +782,8 @@ with `draftKept` set.
      insert **with the stored sent-copy bytes**, never the current draft, which may have been
      edited or deleted. If history has expired, so reconciliation can't be done, or the
      stored bytes are gone, alert rather than guess. A duplicate Sent copy is cosmetic, but
-     it's still avoided.
+     it's still avoided. Each filing cycle has its own baseline. How a retry after `UNFILED`
+     gets a fresh one is described under the recovery sweep below.
 - **Pre-send check:** only on the **first submission of a confirmation** (`CONFIRMED` →
   `SENDING`), re-fetch the draft and require `messageId == confirmed messageId`.
   - Every later attempt submits the stored MIME and never consults the draft. That covers
@@ -912,18 +913,28 @@ with `draftKept` set.
       `filingHistoryId` once. A delivered message never misses its Sent copy and draft
       deletion, so a leftover draft can't be sent again by hand.
     - **`FILING`** → reconcile against the *original* `filingHistoryId`, then file. It is
-      never re-recorded on later runs.
+      never re-recorded on later runs of the same filing cycle.
     - **`FILED`** → delete the draft (retried).
     - **`DONE`** → nothing. A `SENT_PARTIAL` dispatch stays non-terminal while rejections
       are outstanding, but that never triggers filing again; only its retry actions remain;
     - **`UNFILED`** → nothing. Filing moves here, incrementing `filingCycle`, when its
-      retries are exhausted. The track
-      is parked (no `nextStepAt`), the draft is kept (file first, then delete), and you're
-      alerted.
+      retries are exhausted. The track is parked (no `nextStepAt`), the draft is kept (file
+      first, then delete), and you're alerted.
+      - **Entering `UNFILED` settles every earlier insert.** Before parking, the filer
+        reconciles once more against `filingHistoryId`, while that history is still fresh.
+        It waits a short margin first, so a lost-response insert has had time to appear.
+        - Found a copy: filing moves to `FILED` instead.
+        - Found none: no earlier insert landed. The dispatch records `filingSettled`.
+        - Couldn't reconcile (history already expired, e.g. after a long outage): it
+          records `filingUnsettled`.
       - **"Retry filing"** (a one-time token action like the others) moves it back to
         `FILING` with a fresh filing-track schedule (`nextStepAt` = now, next
-        `scheduleGen`). It keeps the *original* `filingHistoryId`, so it still reconciles
-        before inserting.
+        `scheduleGen`).
+        - When `filingSettled`, it starts a **fresh baseline**: a new `filingHistoryId`
+          recorded at the retry. It never depends on the old history, so it works however
+          long the dispatch stayed parked, threaded or unthreaded.
+        - When `filingUnsettled`, it warns that it may file a duplicate Sent copy, which is
+          cosmetic. It proceeds, with a fresh baseline, only on that explicit choice.
       - **"Close"** resolves the dispatch without a copy (see stored MIME above). It's
         refused while delivery work is outstanding: `rejectedRcpts` isn't empty, or an
         attempt is `SENDING`, `RETRY_WAIT` or `UNCERTAIN`. Retry, dismiss or resolve those
@@ -950,7 +961,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `attempt` (per attempt: envelope, result, and its track's `nextStepAt`, `scheduleGen`, `lastEnqueuedAt` and lease), `filingTrack` (`nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, lease, `filingCycle`), `acceptedRcpts`, `rejectedRcpts`, `dismissedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `draftKept`, `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `attempt` (per attempt: envelope, result, and its track's `nextStepAt`, `scheduleGen`, `lastEnqueuedAt` and lease), `filingTrack` (`nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, lease, `filingCycle`, `filingSettled`/`filingUnsettled`), `acceptedRcpts`, `rejectedRcpts`, `dismissedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `draftKept`, `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
