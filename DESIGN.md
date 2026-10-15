@@ -647,15 +647,17 @@ Limits:
      the dropdown** (`GET /dispatch/{draftId}/token?identity=…`, authenticated with the
      device token). The token carries the identity, so there's no separate identity field
      for the server to trust;
-  3. **check that the token is for the version on screen.**
-     - If InboxSDK exposes the saved draft's message ID (spike item), the extension passes
-       it as `&version=…`, and the server refuses to mint for any other version.
-     - Otherwise the server returns, with the token, a summary of the version it bound:
-       recipients, subject, the body's first and last lines and the attachment count. The
-       extension compares that with the compose view's current fields.
-     - On any mismatch (e.g. another device or an autosave changed the draft between the
-       save and the token), it doesn't post. It shows "Draft changed elsewhere — review"
-       instead;
+  3. **require an exact version match.** One-click dispatch needs InboxSDK to expose the
+     saved draft's message ID (spike item).
+     - The extension passes that ID as `&version=…`, and the server refuses to mint for
+       any other version. If another device or an autosave changed the draft between the
+       save and the token, nothing is minted, and the extension shows "Draft changed
+       elsewhere — review".
+     - **Without an exact message ID there's no one-click dispatch.** A summary
+       (recipients, subject, first and last lines, attachment count) can match two
+       versions that differ mid-body or in an attachment. So Send-as opens the PWA's
+       Review screen for that draft instead (A6), where you see the full bound version and
+       confirm it there;
   4. `POST /dispatch {token}` (§4.10);
   5. close the compose view without re-saving.
 - **Guard.** On `presending`, if the thread resolves to a domain identity, call
@@ -724,8 +726,15 @@ with `draftKept` set.
   filing recovery all need the exact bytes the recipients got. The draft may be deleted
   (after `SENT`) or edited by then, and `gmail.compose` + `gmail.metadata` can't read the
   filed Sent copy's body.
-  - **When:** the outbound message and the sent-copy bytes are written at `SENDING`,
-    *before* submission.
+  - **When:** the outbound message is written at `SENDING`, *before* submission.
+    - **The sent copy is built after the result is known.** Its headers depend on the
+      outcome, e.g. `X-Mmail-Rejected` for a partial send. So it's derived from the stored
+      outbound MIME plus the recorded recipient results, after `SENT`/`SENT_PARTIAL` is
+      committed, whether from the SMTP result, a provider-log resolution or "It arrived".
+    - It's written once, as its own object. Filing can't start until it exists: `PENDING`
+      → `FILING` requires `sentCopyObject` to be set.
+    - Every insert retry uses those same bytes. A later successful "retry rejected only"
+      doesn't rewrite them (§4.6).
   - **Where:** a Cloud Storage object with a customer-managed key (Cloud KMS), one per
     dispatch.
   - **Deleted:** once the dispatch is resolved: `DONE` with no partial retry pending, or
@@ -878,8 +887,9 @@ with `draftKept` set.
     - The PWA also passes the `draftMessageId` and generation of the version it's
       previewing (`&version=…&generation=…`). The server refuses to mint if either is no
       longer current, so a stale preview can't be confirmed.
-    - The extension's token is checked against the version it has just saved and is
-      showing, by message ID or by summary (§4.9), before it's posted.
+    - The extension's token request names the exact message ID of the version it has
+      just saved and is showing (§4.9). Without one, the extension hands off to the PWA's
+      Review screen.
   - Each token binds `draftId`, `draftMessageId`, identity, the current `confirmation`
     generation, a server nonce and an expiry (§4.8).
   - **Each token is bound to one action and its target.** The action is one of `confirm`,
@@ -889,8 +899,10 @@ with `draftKept` set.
     - for `confirm` of a new version after an earlier dispatch of the same draft delivered
       to someone, also that dispatch's ID and accepted-set hash (the explicit "Send again
       anyway", §4.10 pre-send check);
-    - for a retry (including `resend-uncertain`), the attempt number it creates, plus the
-      hash of the recipient set for `retry-rejected`;
+    - for a retry (including `resend-uncertain`), the attempt number it creates and the
+      **provider** it uses (primary or secondary), plus the hash of the recipient set for
+      `retry-rejected`. "Retry" and "Retry via secondary provider" are therefore different
+      tokens, and the submission uses the token's provider, never a request field;
     - for `dismiss-rejected`, that recipient-set hash **and the latest attempt number**.
       Starting any attempt advances the number, so a dismissal token fetched before a
       retry is stale afterwards, even if the retry fails and leaves the set unchanged;
@@ -969,8 +981,9 @@ with `draftKept` set.
   - `CONFIRMED` → submit (after `sendAfter`);
   - `RETRY_WAIT` → submit again;
   - filing steps are driven by the **filing status alone**:
-    - **`PENDING`**, when delivery is `SENT`/`SENT_PARTIAL` → start `FILING`, recording
-      `filingHistoryId` once. A delivered message never misses its Sent copy and draft
+    - **`PENDING`**, when delivery is `SENT`/`SENT_PARTIAL` → build the sent copy if
+      `sentCopyObject` isn't set yet (idempotent: same inputs, same bytes, written once),
+      then start `FILING`, recording `filingHistoryId` once. A delivered message never misses its Sent copy and draft
       deletion, so a leftover draft can't be sent again by hand.
     - **`FILING`** → reconcile against the *original* `filingHistoryId`, then file. It is
       never re-recorded on later runs of the same filing cycle.
@@ -1021,7 +1034,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `attempt` (per attempt: envelope, result, and its track's `nextStepAt`, `scheduleGen`, `lastEnqueuedAt` and lease), `filingTrack` (`nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, lease, `filingCycle`, `filingSettled`/`filingUnsettled`), `acceptedRcpts`, `rejectedRcpts`, `dismissedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `draftKept`, `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `attempt` (per attempt: envelope, result, and its track's `nextStepAt`, `scheduleGen`, `lastEnqueuedAt` and lease), `filingTrack` (`nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, lease, `filingCycle`, `filingSettled`/`filingUnsettled`), `acceptedRcpts`, `rejectedRcpts`, `dismissedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `sentCopyObject` (the sent copy, written once after the delivery result), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `draftKept`, `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
