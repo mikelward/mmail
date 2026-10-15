@@ -133,10 +133,17 @@ durability, and that is where silent loss comes from.
 
 This is what makes it trustworthy rather than scary.
 
-- **End-to-end canary.** This is the one that matters. Every 10 minutes an external sender
-  mails a probe address on `example.net`: a scheduled Apps Script in a separate Google
-  account works. A checker confirms it arrived in Gmail *rewritten*, within 5 minutes. A
-  second canary replies through the relay and confirms delivery. Alert after two misses.
+- **End-to-end canary.** This is the one that matters. An external sender mails a probe
+  address on `example.net` on a schedule. A checker confirms it arrived in Gmail
+  *rewritten*, within 5 minutes. A second canary replies through the relay and confirms
+  delivery. Alert after two misses. **Mind the sender's quota:**
+  - A scheduled Apps Script in a separate consumer Google account is limited to 100
+    recipients/day. Probing every 20 minutes is 72/day, inside the limit, with an alert
+    after ~40 minutes.
+  - For a 10-minute cadence (144/day) use a sender with more quota: a cron job on a small
+    VM or Cloud Run job sending through a *separate* provider account, or a Workspace
+    account.
+  - Run the reply-path canary hourly (24/day), so it doesn't eat the same quota.
 - **Metrics:**
   - Postfix queue size and oldest message age;
   - deferred counts by reason;
