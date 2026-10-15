@@ -105,7 +105,7 @@ notification. Nothing else happens.
   ┌──────────────────────────────────────────┐           │
   │      Gmail mailbox (me@gmail.com)        │           │
   └──────────────────────────────────────────┘           │
-     │ users.watch(DRAFT, SENT)   ▲ drafts.get/delete    │
+     │ users.watch (no filter)    ▲ drafts.get/delete    │
      ▼                            │ threads.get(metadata)│
   Cloud Pub/Sub                   │ messages.insert      │
      │ push (OIDC)                │                      │
@@ -556,8 +556,9 @@ tidy-up, **off the critical path**: the mail has already gone out, and the fixer
 corrects where your copy of it is filed.
 
 1. **Find** messages that are in the label the app uses (from E2), are `From:` one of your
-   domain identities, and don't carry the system `SENT` label. Triggered by `users.watch` on
-   that label, or a run every few minutes.
+   domain identities, and don't carry the system `SENT` label. Triggered by the change feed
+   (§4.2), whose unfiltered watch is filtered locally for additions to that label, or by a
+   run every few minutes.
 2. **Re-file** a copy with the pinned strategy (S1/S2): same bytes, same Message-ID, same
    thread.
 3. **Verify** that the new copy carries `SENT` and sits in the same thread. Only then
