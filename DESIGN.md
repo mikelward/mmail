@@ -351,8 +351,15 @@ attachments and inline `cid:` images, pass through untouched.**
     provider, so recovery always knows a submission may have happened.
   - **Resolving `UNCERTAIN`:** if the provider exposes a searchable send log (smtp2go's
     activity search, Forward Email's emails API; untested), recovery looks up our Message-ID.
-    - **A positive record** of it means the provider accepted the message, so it resolves to
-      `SENT`.
+    - **A positive record with per-recipient results for every envelope recipient** resolves
+      it automatically:
+      - all accepted → `SENT`;
+      - some rejected → `SENT_PARTIAL`, with the accepted and rejected sets, the warning and
+        "retry rejected only".
+    - **A positive record without per-recipient detail** only proves the message was
+      accepted for *someone*. It stays `UNCERTAIN`, now marked "accepted, recipients
+      unknown". It never resolves to full `SENT`, so a lost rejection can't masquerade as
+      success.
     - **No record, an unavailable log, or anything inconclusive leaves it `UNCERTAIN`.**
       Logs can lag or be incomplete even after acceptance, so a missing record never becomes
       `FAILED` and never triggers a resend. You decide, and recovery can re-check the log
@@ -567,8 +574,14 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
     *before* submission.
   - **Where:** a Cloud Storage object with a customer-managed key (Cloud KMS), one per
     dispatch.
-  - **Deleted:** once the dispatch is `DONE` with no partial retry pending, with a bucket
-    lifecycle rule (e.g. 14 days) as a backstop.
+  - **Deleted:** once the dispatch is resolved: `DONE` with no partial retry pending, or
+    explicitly closed by you.
+    - **Unresolved objects are kept indefinitely,** however long an `UNCERTAIN` or
+      partial-retry decision takes. The daily health job alerts on any dispatch unresolved for
+      more than 3 days.
+    - **Resolution** moves the object under a `resolved/` prefix before deleting it. The
+      bucket's age-based lifecycle rule (e.g. 14 days) matches **only that prefix**. It's a
+      backstop for failed deletes, so it can never remove bytes an open dispatch still needs.
   - **If it's gone:** recovery **never reconstructs from the current draft**. It alerts
     instead.
 - **Lease:** each transition is a Firestore transaction. `SENDING` takes a lease on that
@@ -613,8 +626,9 @@ Firestore (Native mode), single user:
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
 **Message bodies are stored only as the encrypted outbound MIME of unresolved dispatches**
-(Cloud Storage with a customer-managed key, deleted on resolution, with a lifecycle backstop;
-§4.10). They're never stored in Firestore or logs. Logs carry IDs and states, never subjects
+(Cloud Storage with a customer-managed key). They're kept until resolution however long that
+takes, then deleted, with a lifecycle backstop that applies only to resolved objects
+(§4.10). They're never stored in Firestore or logs. Logs carry IDs and states, never subjects
 or addresses.
 
 ## 6. Deployment
@@ -622,7 +636,8 @@ or addresses.
 - **Default: Google Cloud in `me@gmail.com`'s own project.**
   - Cloud Run (min instances 0), Pub/Sub, Cloud Tasks, Cloud Scheduler (3 jobs: watch renew,
     reconcile, daily health), Firestore, Secret Manager, and a Cloud Storage bucket with a
-    Cloud KMS key and a lifecycle rule for in-flight outbound MIME.
+    Cloud KMS key for in-flight outbound MIME. Its lifecycle rule matches only the
+    `resolved/` prefix.
   - For one user this all sits inside the free tiers (inferred; check the billing report after
     a month).
   - The PWA is served from the service's default `*.run.app` URL. Nothing here should
@@ -729,7 +744,7 @@ or addresses.
 | Refresh token revoked (password change) | token refresh fails | health alert via Web Push; re-auth link in PWA; Gmail's own Send still works |
 | Provider down or rejecting before `DATA` | connection error, 4xx/5xx at `MAIL`/`RCPT` | automatic retries with backoff, then `FAILED`; draft kept; "Retry" / "Retry via secondary provider" start the next attempt of the same dispatch from the stored MIME, with no edit needed |
 | Timeout after DATA | socket error | `UNCERTAIN`; never auto-retried; user checks recipient/provider log |
-| Process dies mid-submission (the provider may have accepted) | `SENDING` lease expires with no result | `UNCERTAIN`; resolved from the provider's send log by Message-ID if available, else you decide; never resent automatically |
+| Process dies mid-submission (the provider may have accepted) | `SENDING` lease expires with no result | `UNCERTAIN`; resolved from the provider's send log by Message-ID only when it gives per-recipient results (→ `SENT` or `SENT_PARTIAL`), else you decide; never resent automatically |
 | Insert fails, or its outcome is unknown (lost response, crash before `FILED`) | API error or a dispatch left in `FILING` | reconcile by `X-Mmail-Dispatch` (thread or history since the recorded `historyId`) before any retry (§4.10); then retry with backoff → `SENT_UNFILED` + alert; mail *was* sent |
 | Copy filed but without `SENT` (Gmail behaviour changed, e.g. at the January cutover) | label read-back after filing | alert: re-run `mmail doctor` and re-pin `sent_strategy`; no automatic second filing |
 | Draft delete fails after a successful send | API error | leftover-draft warning in the notification; retried on every reconcile |
