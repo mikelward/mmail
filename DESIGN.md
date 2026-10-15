@@ -1,8 +1,9 @@
 # mmail: design
 
 Status: draft, 2026-10-15. Read [OPTIONS.md](OPTIONS.md) first for why we build this. This
-document covers **Option 2 (mmail Outbox)** in detail, plus the optional reverse-alias relay
-(Option 3b) and the inventory tool (experiment E0).
+document covers **Option 2 (mmail Outbox)** in detail, including a smaller web-only mode for
+when the Gmail app handles Android (Option 4), the optional Sent fixer, and the inventory
+tool (experiment E0).
 
 Placeholders: `me@gmail.com` is the primary consumer Gmail account and mail store;
 `me@example.net` is a custom-domain identity, one of several.
@@ -24,13 +25,15 @@ Goals:
 - **G5** Be safe by construction:
   - never send anything that isn't one of your drafts, confirmed by you;
   - never send twice;
-  - never lose a draft.
+  - never lose a draft;
+  - never sit on the inbound path. If mmail is down, mail still arrives and Gmail's own Send
+    still works (OPTIONS.md R7).
 - **G6** Cost ≈ $0/month and need no routine babysitting.
 
 Non-goals:
 
 - A mail client: no reading, searching or rendering mail.
-- Changing inbound delivery (except in the optional relay, §10).
+- Anything on the inbound path. Inbound mail keeps flowing Forward Email → Gmail untouched.
 - Multi-user support, or publishing the OAuth app.
 - Sending through Gmail's SMTP or API with a spoofed From. Gmail rewrites a non-alias From
   to the account address (reported), so it can't be the transport anyway.
@@ -116,6 +119,13 @@ notification. Nothing else happens.
 parties are the SMTP provider, which already sees the outbound mail today, and the browser's
 push service, which carries only an encrypted, minimal payload.
 
+**Web-only mode.** If E2 shows the Gmail Android app can send as the domain by itself
+(OPTIONS.md Option 4), mmail only has to serve Gmail web. Then the change feed (§4.2), the
+draft tracker and notifications (§4.3, §4.8) and Pub/Sub, Cloud Tasks and Web Push all go
+away. The extension calls `/dispatch` with a draft ID, and everything from the identity
+resolver to the Sent copy works unchanged. That's a much smaller service: Cloud Run, Firestore
+and Secret Manager.
+
 ## 4. Components
 
 ### 4.1 Gmail access
@@ -136,6 +146,7 @@ push service, which carries only an encrypted, minimal payload.
   | `gmail.metadata` | restricted | `users.watch`, `history.list`, `threads.get(format=metadata)` for identity and threading headers; reading back a filed copy's labels |
   | `gmail.insert` | restricted | `messages.insert` / `messages.import` for the sent copy (§4.7) |
   | `gmail.labels` | non-sensitive | create the `mmail/…` audit labels |
+  | `gmail.modify` | restricted | **optional Sent fixer only**, as a separate grant held only by the fixer job (§4.7) |
 
   - We avoid `gmail.modify`/`gmail.readonly`, because mmail never needs to read message
     *bodies* other than drafts.
@@ -357,20 +368,46 @@ So:
 
 #### Sent copies from the other paths
 
-These matter if the interim workflows (OPTIONS.md D/E) or a relay are in use:
+These matter if Option 4 or the interim workflows (OPTIONS.md D/E) are in use:
 
-- **Gmail app "Other" IMAP identity (Option 4):** the app APPENDs the copy itself, possibly to
-  a new user label "Sent" instead of `[Gmail]/Sent Mail` (E2).
+- **Gmail app "Other" IMAP identity (Option 4):** the app APPENDs the copy itself. E2 tells us
+  where it lands:
+  - in `[Gmail]/Sent Mail` (fine);
+  - in some other label, e.g. a "Sent" folder the app created (fixable, below);
+  - nowhere, if Gmail refuses the folder (not fixable).
 - **FairEmail / Thunderbird (Option 7):** point the identity's Sent folder at
   `[Gmail]/Sent Mail`. In Thunderbird that's the identity's Copies & Folders setting; FairEmail
   does it automatically.
-- **Relay (§10):** Gmail files a genuine `SENT` copy, but it says From `me@gmail.com` and To
-  the relay addresses, not what recipients got. Adding an as-delivered copy would double the
-  thread, so leave it, and keep the mapping in the relay.
-- **Optional "Sent fixer" job:** finds copies filed in the wrong place (e.g. Option 4's "Sent"
-  label), re-files them with the pinned strategy, and trashes the original. It needs
-  `gmail.modify` to read bodies and trash, so only build it if Option 4 becomes the
-  long-term Android path.
+
+#### Optional: Sent fixer
+
+Only needed if E2 shows Option 4's copies landing in the wrong label. It's a background
+tidy-up, **off the critical path**: the mail has already gone out, and the fixer only
+corrects where your copy of it is filed.
+
+1. **Find** messages that are in the label the app uses (from E2), are `From:` one of your
+   domain identities, and don't carry the system `SENT` label. Triggered by `users.watch` on
+   that label, or a run every few minutes.
+2. **Re-file** a copy with the pinned strategy (S1/S2): same bytes, same Message-ID, same
+   thread.
+3. **Verify** that the new copy carries `SENT` and sits in the same thread. Only then
+   **move the original to Trash**, which is recoverable for 30 days. It never hard-deletes.
+4. **Log** each fix and label the new copy `mmail/fixed`.
+
+Safeguards (OPTIONS.md R7):
+
+- opt-in, with a dry-run mode that only reports what it would do;
+- matches only that narrow pattern;
+- idempotent: it skips any Message-ID that already has a `SENT` copy;
+- runs under its **own** OAuth grant with `gmail.modify`, so the dispatcher keeps its narrow
+  scopes;
+- if Gmail ever starts filing the copies correctly, it finds nothing and does nothing.
+
+Limits:
+
+- it can't help if no strategy yields `SENT` (then S4/S5 only), or if the app saves no copy at
+  all;
+- a copy sits in the wrong label until the next run.
 
 ### 4.8 Notifier and PWA
 
@@ -474,7 +511,6 @@ Firestore (Native mode), single user:
   packages/server      Cloud Run service: /pubsub, /dispatch, /api, push, filer
   packages/web         PWA + service worker
   packages/extension   Gmail web extension (phase 3)
-  packages/relay       optional reverse-alias relay (phase 4)
   tools/inventory      E0: Takeout mbox → CSV
   infra/               gcloud/terraform for the project, topic, queues, secrets
   ```
@@ -545,59 +581,12 @@ Firestore (Native mode), single user:
 | Sent copy doesn't thread | E3 / user report | file without `threadId`; still in Sent and search |
 | Server down entirely | health check from outside (e.g. a free uptime monitor) | drafts just wait; Gmail's Send is the manual fallback |
 
-## 10. Optional phase 4: reverse-alias relay
+## 10. Rejected: reverse-alias relay
 
-This gives zero-tap replies through Gmail's native Send. It's built on Forward Email
-features we already pay for, with no MX change. Trial a bought one (addy.io) first; see
-OPTIONS.md E4.
-
-### Address scheme
-
-Use a dedicated subdomain `r.example.net`, with MX at Forward Email and a catch-all regex alias
-that delivers to a webhook. Addresses are readable, e.g. `alice=example.org@r.example.net`,
-optionally prefixed with an identity, e.g. `shop+alice=example.org@r.example.net`. That lets
-you type new contacts by hand.
-
-### Outbound (Gmail → relay → world)
-
-1. Forward Email POSTs the raw message plus its `dkim`/`spf`/`dmarc` results to the relay,
-   with `X-Webhook-Signature` (doc).
-2. The relay verifies:
-   - the webhook signature;
-   - DKIM pass with `d=gmail.com`;
-   - `From` exactly `me@gmail.com`;
-   - `h=` covers `to` and `cc`;
-   - the DKIM `t=` is recent;
-   - the Message-ID hasn't been seen before.
-
-   It takes recipients **from the signed headers**, not from RCPT. Don't rely on gmail.com's
-   DMARC policy, which is `p=none`.
-3. It rewrites `From` to the identity and maps relay addresses back to real addresses. It
-   strips Gmail headers, keeps `In-Reply-To`/`References`, sets a fresh Message-ID, and
-   submits via the transport (§4.6).
-4. Any To/Cc address in the Gmail copy that *wasn't* a relay address already received the
-   message straight from `me@gmail.com`. The relay can't prevent that, so it alerts.
-
-### Inbound (world → relay → Gmail)
-
-1. `*@example.net` routes to the relay webhook instead of being forwarded to Gmail.
-2. If the original sender authenticates (DMARC pass or aligned DKIM pass), the relay rewrites
-   the other parties in `From`, `To`, `Cc` and `Reply-To` into relay addresses, keeping
-   display names, and adds `X-Mmail-Original-*` headers.
-3. It delivers through Gmail API `messages.import`, which applies Gmail's normal spam
-   classification (but no SPF check), with `processForCalendar=true`.
-4. Unauthenticated mail is imported *unmodified* with an `mmail/unverified` label, so it has no
-   relay reply path.
-
-**Costs:**
-
-- the relay is now in the **inbound critical path**. If it's down, Forward Email retries and
-  then defers with 421, and senders' servers keep retrying;
-- Gmail's view of senders degrades (original DKIM is gone, no avatars or unsubscribe);
-- autocomplete fills up with relay addresses;
-- mmail Outbox's identity resolver must map relay addresses back.
-
-**Pilot it on a secondary address before the primary.**
+An earlier draft had an optional relay here. It rewrote inbound mail so that Gmail's normal
+Reply would route through a relay address that sends as the domain. It's rejected because it
+puts a rewriter on the inbound critical path, where any fault means mail that silently never
+arrives (OPTIONS.md R7, Option 3).
 
 ## 11. Inventory tool (E0)
 
@@ -635,9 +624,8 @@ still exists.
 |---|---|---|
 | **M0** | 2026-10-31 | E0 inventory; E2 Gmail-app IMAP test (the interim Android path); E3 API spikes to check assumptions A1–A7. |
 | **M1** | 2026-11-21 | Prototype: CLI `mmail dispatch <draftId>` + `mmail doctor` (§4.7) + `core` transform + filer, run locally against real drafts; ntfy notification from a polling loop. Verifies threading, sent copy strategy, DKIM. |
-| **M2** | 2026-12-12 | Cloud Run + Pub/Sub + Firestore + Cloud Tasks; PWA with Web Push actions; identity resolver; undo; accidental-send heads-up; health alerts. Daily driver on Android. |
-| **M3** | 2027-01-09 | Gmail web extension (button + guard). Until then, desktop uses notifications or the PWA. |
-| **M4** | 2027 Q1, optional | Relay pilot on a secondary address (or adopt addy.io). |
+| **M2** | 2026-12-12 | *If E2 failed:* Cloud Run + Pub/Sub + Firestore + Cloud Tasks; PWA with Web Push actions; identity resolver; undo; accidental-send heads-up; health alerts. Daily driver on Android. *If E2 passed:* web-only mode (§3) instead, plus the Sent fixer if E2 showed copies in the wrong label. |
+| **M3** | 2027-01-09 | Gmail web extension (button + guard). Until then, desktop uses Thunderbird, Forward Email webmail, or (full mode) notifications and the PWA. |
 
 Interim fallback for any slippage: FairEmail on Android and Thunderbird on desktop, both with a
 `me@example.net` identity on smtp2go (OPTIONS.md workflows D/E).
