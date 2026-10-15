@@ -547,8 +547,8 @@ Limits:
     dispatch (§4.10).
   - **Expired tokens are refreshed on tap.** A notification can sit untouched for longer
     than 15 minutes. If the embedded token has expired when you tap Send, the service
-    worker uses its device credential to fetch a fresh one for the **same draft version and
-    generation** (`GET /dispatch/{draftId}/token`), then posts that.
+    worker uses its device credential to fetch a fresh one for the **same draft version,
+    generation and identity** (`GET /dispatch/{draftId}/token?identity=…`), then posts that.
     - If the draft or generation changed meanwhile, the server returns the current state
       and the notification is updated instead. You're never asked to confirm a version you
       didn't see.
@@ -576,8 +576,10 @@ Limits:
 - **Compose button.** Add **Send as ▾** to each compose view, preselected via
   `GET /identity?threadId=…`. On click:
   1. make sure the draft is saved (wait for InboxSDK's saved state, then `getDraftID()`);
-  2. fetch a confirmation token for the saved draft version (`GET /dispatch/{draftId}/token`,
-     authenticated with the device token), then `POST /dispatch {token, identity}` (§4.10);
+  2. fetch a confirmation token for the saved draft version **and the identity chosen in
+     the dropdown** (`GET /dispatch/{draftId}/token?identity=…`, authenticated with the
+     device token), then `POST /dispatch {token}` (§4.10). The token carries the identity,
+     so there's no separate identity field for the server to trust;
   3. close the compose view without re-saving.
 - **Guard.** On `presending`, if the thread resolves to a domain identity, call
   `event.cancel()` and show the choice dialog (§2.3) (doc for `presending`/`cancel`).
@@ -593,8 +595,8 @@ Limits:
 
 The diagram shows the common path as one line. In storage (§5), a dispatch's **delivery
 status** (`CONFIRMED` … `SENT` / `SENT_PARTIAL` / `FAILED` / `UNCERTAIN`) and its **filing
-status** (`PENDING` / `FILING` / `FILED` / `DONE`) are separate fields. That way, filing a
-copy and deleting the draft never erase a pending partial-delivery decision.
+status** (`PENDING` / `FILING` / `FILED` / `DONE` / `UNFILED`) are separate fields. That
+way, filing a copy and deleting the draft never erase a pending partial-delivery decision.
 
 ```
 OFFERED ──confirm──► CONFIRMED ──undo window──► SENDING ──2xx──► SENT ──insert──► FILED ──delete──► DONE
@@ -609,7 +611,8 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
 
 `WITHDRAWN` is terminal. A draft version reaches it when the draft is deleted, sent from
 Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-send check
-(below).
+(below). The diagram's `SENT_UNFILED` is delivery `SENT` (or `SENT_PARTIAL`) with filing
+`UNFILED`. Its `DONE_KEPT_DRAFT` is filing `DONE` with `draftKept` set.
 
 - **One dispatch per draft version, for its whole life.** The dispatch document's ID is
   `hash(draftId, draftMessageId)`, created with create-if-absent in the confirming
@@ -625,8 +628,8 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
       starts the next attempt, with no edit needed;
     - while delivery is `SENT_PARTIAL` with rejected recipients outstanding: "retry rejected
       only", with an envelope of just those addresses. This works **whatever the filing
-      status** (`FILING`, `FILED` or `DONE`), and it reuses the existing Sent copy rather
-      than filing another;
+      status** (`FILING`, `FILED`, `DONE` or `UNFILED`). It never files a copy itself: the
+      Sent copy is the filing track's job, and a filed one is reused;
     - after `UNCERTAIN`: **never automatically**. Only your explicit "I've checked, resend
       anyway", which warns that it may duplicate.
 
@@ -712,11 +715,17 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
   needed. It's still one dispatch per draft version, so the uniqueness guard holds.
 - **Every confirmation uses a server-issued, generation-bound, one-time token.** Clients
   never mint their own.
-  - Notification actions carry one.
-  - The PWA and extension fetch one (`GET /dispatch/{draftId}/token`) when they show the
-    Send button, and fetch a new one whenever the dispatch changes.
+  - Notification actions carry one, bound to the identity the notification shows.
+  - The PWA and extension fetch one for the identity currently selected
+    (`GET /dispatch/{draftId}/token?identity=…`) when they show the Send button. They fetch
+    a new one whenever the dispatch **or the selected identity** changes, so a token is
+    only ever minted after the choice is made.
   - Each token binds `draftId`, `draftMessageId`, identity, the current `confirmation`
-    generation, a server nonce and an expiry (§4.8).
+    generation, a server nonce and an expiry (§4.8). The server mints one only for a
+    configured identity.
+  - **The identity comes only from the token.** `/dispatch` takes no separate identity
+    field. The confirming transition records the token's identity on the dispatch, so a
+    reconfirmation after Undo may pick a different one.
 
   `/dispatch` applies it in one transaction:
   - **Wrong generation:** if the token's generation isn't the dispatch's *current* one, the
@@ -775,6 +784,14 @@ Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-se
     - **`FILED`** → delete the draft (retried).
     - **`DONE`** → nothing. A `SENT_PARTIAL` dispatch stays non-terminal while rejections
       are outstanding, but that never triggers filing again; only its retry actions remain;
+    - **`UNFILED`** → nothing. Filing moves here when its retries are exhausted. The track
+      is parked (no `nextStepAt`), the draft is kept (file first, then delete), and you're
+      alerted.
+      - **"Retry filing"** (a one-time token action like the others) moves it back to
+        `FILING` with a fresh filing-track schedule (`nextStepAt` = now, next
+        `scheduleGen`). It keeps the *original* `filingHistoryId`, so it still reconciles
+        before inserting.
+      - **"Close"** resolves the dispatch without a copy (see stored MIME above);
   - **any attempt** that is `SENDING` with an expired lease → that attempt becomes
     `UNCERTAIN`. This is checked per attempt, **before and independently of** the
     dispatch's aggregate delivery and filing status. A crashed rejected-only retry under a
@@ -796,7 +813,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `attempt` (per attempt: envelope, result, and its track's `nextStepAt`, `scheduleGen`, `lastEnqueuedAt` and lease), `filingTrack` (`nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, lease), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `attempt` (per attempt: envelope, result, and its track's `nextStepAt`, `scheduleGen`, `lastEnqueuedAt` and lease), `filingTrack` (`nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, lease), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `draftKept`, `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
@@ -920,7 +937,7 @@ or addresses.
 | Provider down or rejecting before `DATA` | connection error, 4xx/5xx at `MAIL`/`RCPT` | automatic retries with backoff, then `FAILED`; draft kept; "Retry" / "Retry via secondary provider" start the next attempt of the same dispatch from the stored MIME, with no edit needed |
 | Timeout after DATA | socket error | `UNCERTAIN`; never auto-retried; user checks recipient/provider log |
 | Process dies mid-submission (the provider may have accepted) | `SENDING` lease expires with no result | `UNCERTAIN`; resolved from the provider's send log only by a record **uniquely attributable to the current attempt** (its `X-Mmail-Attempt` marker or provider tag, never Message-ID alone) that gives per-recipient results for that attempt's whole envelope (→ `SENT` or `SENT_PARTIAL`); otherwise you decide; never resent automatically |
-| Insert fails, or its outcome is unknown (lost response, crash before `FILED`) | API error or a dispatch left in `FILING` | reconcile by `X-Mmail-Dispatch` (thread or history since the recorded `historyId`) before any retry (§4.10); then retry with backoff → `SENT_UNFILED` + alert; mail *was* sent |
+| Insert fails, or its outcome is unknown (lost response, crash before `FILED`) | API error or a dispatch left in `FILING` | reconcile by `X-Mmail-Dispatch` (thread or history since the recorded `historyId`) before any retry (§4.10); then retry with backoff → filing `UNFILED` (`SENT_UNFILED`) + alert; "Retry filing" reactivates it; mail *was* sent |
 | Copy filed but without `SENT` (Gmail behaviour changed, e.g. at the January cutover) | label read-back after filing | alert: re-run `mmail doctor` and re-pin `sent_strategy`; no automatic second filing |
 | Draft delete fails after a successful send | API error | leftover-draft warning in the notification; retried on every reconcile |
 | Draft edited after confirm | message ID mismatch | before send: this dispatch becomes `WITHDRAWN` (terminal) and the edited version is offered afresh, getting its own dispatch when confirmed; after send: draft kept |
