@@ -646,8 +646,14 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
 - **Partial sends:** `SENT_PARTIAL` (§4.6) runs filing and draft deletion just like `SENT`,
   but its delivery status stays `SENT_PARTIAL` until every rejected recipient has been
   retried successfully or you dismiss them.
-  - Its "retry rejected only" attempt is keyed by the dispatch and the rejected set, so it
-    is idempotent in the same way, and it submits the stored outbound MIME.
+  - Each "retry rejected only" action creates a **new attempt** keyed
+    `(dispatchId, attempt n)`, where `n` increments with every retry action. It submits the
+    stored outbound MIME to the rejected set.
+    - Replays of that *one* action are de-duplicated by its server-issued one-time token
+      (the same generation-bound token model as confirmations). A repeated tap, or a retried
+      request, returns attempt `n` rather than starting another.
+    - After an attempt fails before `DATA`, the next retry action gets attempt `n+1` and
+      really submits again.
   - A successful retry updates `acceptedRcpts`/`rejectedRcpts` and the delivery status,
     without touching the filed Sent copy.
   - The dispatch counts as resolved, so its stored MIME can be deleted, only when filing is
