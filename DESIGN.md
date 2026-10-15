@@ -406,8 +406,13 @@ attachments and inline `cid:` images, pass through untouched.**
       success.
     - **No record, an unavailable log, or anything inconclusive leaves it `UNCERTAIN`.**
       Logs can lag or be incomplete even after acceptance, so a missing record never becomes
-      `FAILED` and never triggers a resend. You decide, and recovery can re-check the log
-      later.
+      `FAILED` and never triggers a resend. You decide.
+    - **An `UNCERTAIN` attempt keeps polling.** Its track keeps a `nextStepAt` on a widening
+      schedule (e.g. 5 min, 15 min, 1 h, then every 6 h). When it's due, the sweep re-runs
+      the lookup, so a record that turns up late still resolves it as above. Polling stops
+      once the provider's log retention has passed. The attempt is then parked with no
+      `nextStepAt`, and only you can resolve it. Polling only ever reads the log; it never
+      resubmits.
 - **DNS:** unchanged from today's Send-as setup: provider DKIM, and SPF or a custom
   return-path. Once mmail is the only outbound path, consider moving DMARC to `p=quarantine`.
 - **Provider limits:** smtp2go free is 1,000/month and 200/day (25/hour until the domain is
@@ -675,8 +680,17 @@ with `draftKept` set.
       really submits again.
   - A successful retry updates `acceptedRcpts`/`rejectedRcpts` and the delivery status,
     without touching the filed Sent copy.
+  - **"Dismiss"** (`dismiss-rejected`, bound to the current rejected-set hash) moves the
+    outstanding rejected recipients to `dismissedRcpts`.
+    - It's refused while an attempt is `SENDING` or `RETRY_WAIT`.
+    - Delivery stays `SENT_PARTIAL`, since that's still the truth, but nothing remains
+      outstanding.
+    - If the rejected set has changed since the token was minted, e.g. a retry landed in
+      between, the hash no longer matches and you're shown the new state.
   - The dispatch counts as resolved, so its stored MIME can be deleted, only when filing is
-    `DONE` *and* no rejected recipient is outstanding.
+    `DONE` *and* no rejected recipient is outstanding (`rejectedRcpts` is empty, because each
+    was either retried successfully or dismissed). Whichever of filing `DONE`, a successful retry or a dismissal comes last
+    resolves it: its stored MIME is deleted and the unresolved-dispatch alerts stop.
 - **Write-ahead:** `SENDING`, with the outbound Message-ID, is committed before submission,
   and `SENT` right after the 2xx. The only window where the outcome is unknown is between
   those two commits, and it always resolves to `UNCERTAIN`. So "never send twice" (G5) holds
@@ -711,6 +725,12 @@ with `draftKept` set.
     `confirmation` number. Stale tasks do nothing.
   - Undo moves the dispatch to `CANCELLED` and deletes the task. If the delete fails, the
     stale-task check covers it.
+  - **Undo is a token action too** (`undo`, below). Its target is the `confirmation`
+    generation it cancels. The confirming transaction mints it, and the "Sending… [Undo]"
+    notification and the `/dispatch` response carry it. It acts only if the dispatch is
+    still `CONFIRMED` at that generation, and it consumes its nonce in the same
+    transaction. A retried or delayed Undo for confirmation N can't cancel a later
+    reconfirmation N+1. It only returns the current state.
 - **Cancelled isn't final.** Nothing was submitted, so a later confirmation of the same
   draft version (a new tap or click) moves the existing dispatch from `CANCELLED` back to
   `CONFIRMED` with a fresh undo window and the next `confirmation` number. No draft edit is
@@ -725,9 +745,12 @@ with `draftKept` set.
   - Each token binds `draftId`, `draftMessageId`, identity, the current `confirmation`
     generation, a server nonce and an expiry (§4.8).
   - **Each token is bound to one action and its target.** The action is one of `confirm`,
-    `retry`, `retry-rejected`, `resend-uncertain`, `retry-filing` or `close`. The target is
-    action-specific: for a retry, the attempt number it creates, plus the hash of the
-    recipient set for `retry-rejected`. The server stores the action and target with the
+    `undo`, `retry`, `retry-rejected`, `dismiss-rejected`, `resend-uncertain`,
+    `retry-filing` or `close`. The target is action-specific:
+    - for `undo`, the `confirmation` generation it cancels;
+    - for a retry, the attempt number it creates, plus the hash of the recipient set for
+      `retry-rejected`;
+    - for `dismiss-rejected`, that recipient-set hash. The server stores the action and target with the
     nonce, and each endpoint accepts only tokens for its own action and the current
     target. A mismatch is rejected without consuming the nonce. So when "Retry filing" and
     "retry rejected only" are both on offer, neither token can authorize the other.
@@ -811,8 +834,9 @@ with `draftKept` set.
         `scheduleGen`). It keeps the *original* `filingHistoryId`, so it still reconciles
         before inserting.
       - **"Close"** resolves the dispatch without a copy (see stored MIME above);
+  - **any attempt** that is `UNCERTAIN` and due → re-run the provider-log lookup (§4.6);
   - **any attempt** that is `SENDING` with an expired lease → that attempt becomes
-    `UNCERTAIN`. This is checked per attempt, **before and independently of** the
+    `UNCERTAIN` and starts polling. This is checked per attempt, **before and independently of** the
     dispatch's aggregate delivery and filing status. A crashed rejected-only retry under a
     `SENT_PARTIAL` dispatch whose filing is already `DONE` is still caught, and can't hold
     its lease forever.
@@ -832,7 +856,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `attempt` (per attempt: envelope, result, and its track's `nextStepAt`, `scheduleGen`, `lastEnqueuedAt` and lease), `filingTrack` (`nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, lease), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `draftKept`, `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `attempt` (per attempt: envelope, result, and its track's `nextStepAt`, `scheduleGen`, `lastEnqueuedAt` and lease), `filingTrack` (`nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, lease), `acceptedRcpts`, `rejectedRcpts`, `dismissedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `draftKept`, `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
