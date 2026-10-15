@@ -664,8 +664,8 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
 ```
 
 `WITHDRAWN` is terminal. A draft version reaches it when the draft is deleted, sent from
-Gmail or edited before mmail sends it, including from `CONFIRMED` via the pre-send check
-(below). A transient failure before `DATA` parks the attempt in `RETRY_WAIT` and returns to
+Gmail or edited before mmail delivers it. The pre-send check (below) catches this at
+`CONFIRMED` and before any resubmission while filing is still `PENDING`. A transient failure before `DATA` parks the attempt in `RETRY_WAIT` and returns to
 `SENDING` when its backoff is due (not drawn). The diagram's `SENT_UNFILED` is delivery
 `SENT` (or `SENT_PARTIAL`) with filing `UNFILED`. Its `DONE_KEPT_DRAFT` is filing `DONE`
 with `draftKept` set.
@@ -784,17 +784,27 @@ with `draftKept` set.
      stored bytes are gone, alert rather than guess. A duplicate Sent copy is cosmetic, but
      it's still avoided. Each filing cycle has its own baseline. How a retry after `UNFILED`
      gets a fresh one is described under the recovery sweep below.
-- **Pre-send check:** only on the **first submission of a confirmation** (`CONFIRMED` →
-  `SENDING`), re-fetch the draft and require `messageId == confirmed messageId`.
-  - Every later attempt submits the stored MIME and never consults the draft. That covers
-    "Retry" after `FAILED`, "retry rejected only", "Resend anyway", and `RETRY_WAIT` →
-    `SENDING`. A normal `SENT_PARTIAL` dispatch has already deleted its draft by then.
+- **Pre-send check:** before **every submission while filing is still `PENDING`**, re-fetch
+  the draft and require `messageId == confirmed messageId`.
+  - **Filing `PENDING`** means nothing is known to have been delivered, so mmail hasn't
+    deleted the draft. You could still have sent it with Gmail or edited it. The check
+    covers:
+    - the first submission (`CONFIRMED` → `SENDING`);
+    - its automatic `RETRY_WAIT` → `SENDING` resubmissions;
+    - "Retry" after `FAILED`;
+    - "Resend anyway" for a first attempt.
+  - **Once filing has started,** mmail deletes the draft itself. Later attempts ("retry
+    rejected only", "Resend anyway" on such a retry) submit the stored MIME without
+    consulting it.
 
-  If the message ID differs, or the draft is gone, nothing has been stored or submitted
-  yet:
-  - This dispatch moves to the **terminal** `WITHDRAWN`. It's keyed to a draft version that
-    no longer exists, so nothing could ever confirm it again, and it must not sit in a
-    non-terminal state for the sweep to chase.
+  If the message ID differs, or the draft is gone, **nothing is submitted**:
+  - If no attempt can have delivered anything (none is `UNCERTAIN`), the dispatch moves to
+    the **terminal** `WITHDRAWN`, and its stored MIME, if any, is deleted. It's keyed to a
+    draft version that no longer exists, so nothing could ever confirm it again, and it
+    must not sit in a non-terminal state for the sweep to chase. A queued retry can
+    therefore never deliver a message you've already sent from Gmail.
+  - If an attempt is `UNCERTAIN`, only the resend is refused. That attempt stays, for "It
+    arrived" or "Give up" (§4.6).
   - An edited draft is a **new version**. It's offered afresh, with a "Draft changed —
     review" notification, and gets its own dispatch (keyed by the new message ID) only when
     you confirm it.
@@ -878,7 +888,8 @@ with `draftKept` set.
     lease**. Only `SENDING` with an expired lease means "may have been accepted"
     (→ `UNCERTAIN`). A parked retry is never mistaken for a crashed submission.
   - When due, `RETRY_WAIT` → `SENDING` (taking the lease again) re-submits the same stored
-    MIME. Once its retry budget is spent, the attempt becomes `FAILED`.
+    MIME, after the pre-send check (below) if filing is still `PENDING`. Once its retry
+    budget is spent, the attempt becomes `FAILED`.
 - **Every transition persists its next step.** Each state commit also writes its track's
   `nextStepAt`, so a process can die between the commit and task creation without
   stranding the dispatch. So does every retry decision: a transient error commits a later
