@@ -133,8 +133,8 @@ push service, which carries only an encrypted, minimal payload.
   | Scope | Tier | Used for |
   |---|---|---|
   | `gmail.compose` | restricted | `drafts.list`, `drafts.get(format=raw)`, `drafts.delete` |
-  | `gmail.metadata` | restricted | `users.watch`, `history.list`, `threads.get(format=metadata)` for identity and threading headers |
-  | `gmail.insert` | restricted | `messages.insert` for the sent copy |
+  | `gmail.metadata` | restricted | `users.watch`, `history.list`, `threads.get(format=metadata)` for identity and threading headers; reading back a filed copy's labels |
+  | `gmail.insert` | restricted | `messages.insert` / `messages.import` for the sent copy (§4.7) |
   | `gmail.labels` | non-sensitive | create the `mmail/…` audit labels |
 
   - We avoid `gmail.modify`/`gmail.readonly`, because mmail never needs to read message
@@ -281,18 +281,96 @@ attachments and inline `cid:` images, pass through untouched.**
 - **Provider limits:** smtp2go free is 1,000/month and 200/day (25/hour until the domain is
   verified). Forward Email starts at 300/day (doc).
 
-### 4.7 Sent-copy filer
+### 4.7 Sent copies (special handling)
 
-- **Insert:** `messages.insert` with the sent-copy bytes, `threadId` (when the draft had one),
-  `internalDateSource=dateHeader`, and `labelIds: [SENT, <mmail/sent>]`.
-  - Gmail threads it if the threadId is given, `In-Reply-To`/`References` are valid, and the
-    Subject matches (doc).
-  - Gmail only auto-applies `SENT` when the From is the user's own address, so we pass the
-    label explicitly. Whether `insert` honours an explicit `SENT` is verified in E3b.
-  - If it doesn't, fall back to IMAP APPEND into `[Gmail]/Sent Mail` (filer-only, app
-    password), or keep `mmail/sent` as the visible label.
-- **Delete:** then `drafts.delete(draftId)`, but only if the draft's message ID still equals
-  the one we sent. If you edited the draft after confirming, it is kept and you're told.
+When Gmail sends a message itself, it files the copy, applies the system `SENT` label,
+threads it and shows it as "me". When anything else sends, none of that happens on its own.
+`SENT` is also a system label that can't be added to an existing message later: the labels
+guide says it is applied automatically and can't be applied manually (doc). So whatever we do
+has to happen **when the copy is created**, and a wrong first attempt can't be patched with
+our narrow scopes.
+
+#### What depends on the copy being a proper Sent message
+
+| Gmail behaviour | Needs `SENT` | Needs From recognised as yours | Needs the delivered Message-ID |
+|---|---|---|---|
+| Sent view in web and apps; `in:sent` | ✓ | | |
+| The reply shows as "me" in the thread; `from:me`; Gemini attributes it to you | | ✓ | |
+| Recipients' replies thread with your copy | | | ✓ (plus `References`, Subject) |
+| An inbound echo of your own message (Cc to yourself, mailing-list copy) is collapsed rather than shown as new mail | probably | | ✓ |
+| Nudges ("Received 3 days ago. Reply?") stop once you've replied | probably | probably | |
+| Importance and "Other contacts" autocomplete learn from people you write to | probably | probably | |
+
+"Probably" means inferred from how these features must work, not documented. Whether Gmail
+still recognises `me@example.net` as yours once it stops being a Send-as alias in January is
+unknown. The alternate email on the Google account (OPTIONS.md R6) may be enough.
+
+#### Filing strategies
+
+Ranked by preference. Each one gets tested in E3b, now while `me@example.net` is still a
+Send-as alias **and again after the January cutover**.
+
+| # | Method | Gets `SENT`? | Keeps true From? | Threads? | Cost / risk |
+|---|---|---|---|---|---|
+| **S1** | `messages.insert` with `labelIds: [SENT]`, `threadId`, `internalDateSource=dateHeader` | Docs say `SENT` is auto-applied only when From is the user's address. Explicit `SENT` on insert is common practice but unverified for a non-alias From. | ✓ | ✓ via `threadId` | `gmail.insert` only |
+| **S2** | `messages.import`, same labels, `neverMarkSpam=true`, `processForCalendar=false` | GYB restores sent mail by passing `SENT` on import (reported; those copies have your own From) | ✓ | ✓ | Same scope. Runs Gmail's classifier. |
+| **S3** | IMAP `APPEND` to `[Gmail]/Sent Mail` | ✓ This is how Thunderbird and FairEmail file external-SMTP sends | ✓ | by headers only (no `threadId`) | Needs an app password (full mailbox access) or the `mail.google.com` scope; a second auth path |
+| **S4** | `messages.insert` with From rewritten to `me@gmail.com`, plus `X-Mmail-Sent-As: me@example.net` and label `mmail/as/me@example.net` | ✓ (documented auto-apply) | ✗ the archive shows the Gmail address | ✓ | Your archive differs from what recipients saw. The header and label keep the truth and let identity resolution (§4.4) find it. |
+| **S5** | `messages.insert` with user label `mmail/sent` only | ✗ | ✓ | ✓ | Nothing in the Sent view; nudges and echoes misbehave |
+
+**Choosing a strategy.** We can't silently fall back at runtime: if S1 "succeeds" without
+`SENT`, the bad copy is already in the mailbox, and removing it needs `gmail.modify` or more.
+So:
+
+- **`mmail doctor`** files a test message into a throwaway thread with each strategy and
+  reads back `labelIds` (`messages.get format=minimal`, allowed under `gmail.metadata`). It
+  reports which strategies give `SENT`, thread correctly and show as "me". Run it at setup and
+  again after the January cutover.
+- **The winner is pinned in config** as `sent_strategy`.
+- **After every real filing**, the filer reads back the copy's labels. If `SENT` is missing it
+  raises an alert to re-run `mmail doctor`. It never retries with another strategy, which would
+  file a duplicate.
+
+#### Rules for the copy itself
+
+- **File only after the provider accepts the message (2xx), never before.** A copy filed
+  first would be a phantom if submission fails, and we can't delete it with our scopes.
+- **Same bytes as delivered**, plus the original `Bcc` (so you can see whom you Bcc'd) and
+  `X-Mmail-Dispatch`. The `Date` is stamped at submission time, after the undo window, so the
+  copy sorts correctly in the thread.
+- **Same Message-ID as delivered** (A4). If the provider replaces it, read the provider's
+  value back and use that. Otherwise recipients' replies won't thread with your copy, and
+  echoes won't be collapsed.
+- **No `INBOX` and no `UNREAD`** on the copy, so sending doesn't resurface the thread as
+  unread. An optional `archive_on_send` setting emulates Gmail's "Send & Archive", but it needs
+  `gmail.modify` to remove `INBOX` from the thread, so it's off by default.
+- **File the copy, then delete the draft.** A leftover draft is better than a missing copy.
+  But a leftover draft is also a **footgun**: pressing Gmail's Send on it sends a duplicate
+  from `me@gmail.com`. So the delete is retried on every reconcile, and the notification
+  says "Sent — remove the leftover draft" until it's gone.
+  - `drafts.delete` runs only if the draft's message ID still equals the one we sent. If you
+    edited the draft after confirming, it is kept and you're told.
+- **Echoes.** If you Cc yourself (either address) or post to a list you're on, an inbound copy
+  with the same Message-ID arrives via Forward Email. Gmail collapsing it is expected only
+  with an S1–S3 copy (A8). Otherwise mmail knows the outbound Message-ID and can flag the
+  echo. Hiding it from the inbox would need `gmail.modify`.
+
+#### Sent copies from the other paths
+
+These matter if the interim workflows (OPTIONS.md D/E) or a relay are in use:
+
+- **Gmail app "Other" IMAP identity (Option 4):** the app APPENDs the copy itself, possibly to
+  a new user label "Sent" instead of `[Gmail]/Sent Mail` (E2).
+- **FairEmail / Thunderbird (Option 7):** point the identity's Sent folder at
+  `[Gmail]/Sent Mail`. In Thunderbird that's the identity's Copies & Folders setting; FairEmail
+  does it automatically.
+- **Relay (§10):** Gmail files a genuine `SENT` copy, but it says From `me@gmail.com` and To
+  the relay addresses, not what recipients got. Adding an as-delivered copy would double the
+  thread, so leave it, and keep the mapping in the relay.
+- **Optional "Sent fixer" job:** finds copies filed in the wrong place (e.g. Option 4's "Sent"
+  label), re-files them with the pinned strategy, and trashes the original. It needs
+  `gmail.modify` to read bodies and trash, so only build it if Option 4 becomes the
+  long-term Android path.
 
 ### 4.8 Notifier and PWA
 
@@ -359,9 +437,9 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{id}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `rcptCount`, `provider`, `providerRef`, `state`, `error`, `sentCopyId`, timestamps |
+| `dispatches/{id}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `rcptCount`, `provider`, `providerRef`, `state`, `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, timestamps |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
-| `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds` |
+| `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
 **No message bodies are stored. Logs carry IDs and states, never subjects or addresses.**
 
@@ -459,6 +537,8 @@ Firestore (Native mode), single user:
 | Provider down or rejecting | 4xx/5xx | `FAILED`; draft kept; "Retry" / "Retry via secondary provider" |
 | Timeout after DATA | socket error | `UNCERTAIN`; never auto-retried; user checks recipient/provider log |
 | Insert fails | API error | retry with backoff → `SENT_UNFILED` + alert; mail *was* sent |
+| Copy filed but without `SENT` (Gmail behaviour changed, e.g. at the January cutover) | label read-back after filing | alert: re-run `mmail doctor` and re-pin `sent_strategy`; no automatic second filing |
+| Draft delete fails after a successful send | API error | leftover-draft warning in the notification; retried on every reconcile |
 | Draft edited after confirm | message ID mismatch | send is blocked and re-offered; if after send, draft kept |
 | Gmail app re-uploads a stale offline draft after we deleted it | the same draft content reappears | offered again with a "looks already sent" warning |
 | Gmail Send pressed on a domain thread | `SENT` from `me@gmail.com` in a domain-resolved thread | heads-up push (Android); prevented by guard (web) |
@@ -554,7 +634,7 @@ still exists.
 | Milestone | Target | Contents |
 |---|---|---|
 | **M0** | 2026-10-31 | E0 inventory; E2 Gmail-app IMAP test (the interim Android path); E3 API spikes to check assumptions A1–A7. |
-| **M1** | 2026-11-21 | Prototype: CLI `mmail dispatch <draftId>` + `core` transform + filer, run locally against real drafts; ntfy notification from a polling loop. Verifies threading, sent copy, DKIM. |
+| **M1** | 2026-11-21 | Prototype: CLI `mmail dispatch <draftId>` + `mmail doctor` (§4.7) + `core` transform + filer, run locally against real drafts; ntfy notification from a polling loop. Verifies threading, sent copy strategy, DKIM. |
 | **M2** | 2026-12-12 | Cloud Run + Pub/Sub + Firestore + Cloud Tasks; PWA with Web Push actions; identity resolver; undo; accidental-send heads-up; health alerts. Daily driver on Android. |
 | **M3** | 2027-01-09 | Gmail web extension (button + guard). Until then, desktop uses notifications or the PWA. |
 | **M4** | 2027 Q1, optional | Relay pilot on a secondary address (or adopt addy.io). |
@@ -568,8 +648,9 @@ Interim fallback for any slippage: FairEmail on Android and Thunderbird on deskt
 |---|---|---|
 | A1 | Drafts written in the Gmail Android app reach the server within seconds of leaving compose. | Notify on the PWA instead; add a "sync now" hint. |
 | A2 | `drafts.get(raw)` for a reply includes `In-Reply-To`/`References`. | Threading repair from the thread (§4.5 step 5). |
-| A3 | `messages.insert` accepts `labelIds: [SENT]` with a non-alias From, and threads with `threadId`. | IMAP APPEND to `[Gmail]/Sent Mail`, or the `mmail/sent` label only. |
+| A3 | At least one of S1–S3 (§4.7) files a `SENT` copy with the true From that threads and shows as "me". | S4 (Gmail From in the archive); S5 as a last resort. |
 | A4 | The provider preserves our `Message-ID`. | Read back the provider's ID and use it for the sent copy; or switch provider. |
 | A5 | `gmail.compose` + `gmail.metadata` together allow `drafts.get(raw)` and `threads.get(metadata)`. | Use `gmail.modify` instead (broader). |
 | A6 | The InboxSDK draft ID equals the Gmail API draft ID. | Look the draft up by thread + recipients + recency. |
-| A7 | After January 2027 Gmail still renders our inserted sent copies sensibly even though `me@example.net` is no longer a Send-as alias. | Cosmetic; accept. |
+| A7 | After January 2027 Gmail still renders our inserted sent copies sensibly even though `me@example.net` is no longer a Send-as alias. | Re-run `mmail doctor`; switch to S4 if "me" or `SENT` breaks. |
+| A8 | Gmail collapses inbound echoes (Cc to yourself, list copies) of a message whose `SENT` copy exists with the same Message-ID. | Echoes show as new mail; mmail flags them. |
