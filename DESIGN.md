@@ -451,10 +451,17 @@ attachments and inline `cid:` images, pass through untouched.**
         `ABANDONED`. On a first attempt, the dispatch's delivery becomes `ABANDONED`: no
         Sent copy is filed, the draft is kept as your only record, and the dispatch is
         resolved. On a rejected-only retry, its recipients move to `dismissedRcpts`.
-      - **"Resend anyway"** (`resend-uncertain`, §4.10): in one transaction, the uncertain
-        attempt becomes terminal `SUPERSEDED` and the new attempt is created. The old
-        attempt never blocks resolution, and a late provider record for it is ignored.
-        It may duplicate.
+      - **"Resend anyway"** (`resend-uncertain`, §4.10): it may duplicate. The old attempt
+        is retired only once the replacement is definitely going out:
+        1. If filing is still `PENDING`, the pre-send check (§4.10) runs first.
+        2. Only if that passes does one transaction mark the uncertain attempt terminal
+           `SUPERSEDED` and commit the new attempt's `SENDING`.
+        3. If the check fails, the resend is refused and nothing changes. The old attempt
+           stays `UNCERTAIN`, still polling and still blocking withdrawal, so its stored
+           MIME is kept and "It arrived" / "Give up" remain available.
+
+        Once superseded, the old attempt never blocks resolution, and a late provider
+        record for it is ignored.
 - **DNS:** unchanged from today's Send-as setup: provider DKIM, and SPF or a custom
   return-path. Once mmail is the only outbound path, consider moving DMARC to `p=quarantine`.
 - **Provider limits:** smtp2go free is 1,000/month and 200/day (25/hour until the domain is
