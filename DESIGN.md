@@ -567,6 +567,11 @@ Limits:
 
 ### 4.10 Dispatch state machine
 
+The diagram shows the common path as one line. In storage (§5), a dispatch's **delivery
+status** (`CONFIRMED` … `SENT` / `SENT_PARTIAL` / `FAILED` / `UNCERTAIN`) and its **filing
+status** (`PENDING` / `FILING` / `FILED` / `DONE`) are separate fields. That way, filing a
+copy and deleting the draft never erase a pending partial-delivery decision.
+
 ```
 OFFERED ──confirm──► CONFIRMED ──undo window──► SENDING ──2xx──► SENT ──insert──► FILED ──delete──► DONE
    │                    │ undo                     │ 5xx            │ insert fails         │ draft edited
@@ -590,7 +595,10 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
     `(dispatchId, attempt)` so each is idempotent too:
     - after `FAILED`: nothing was accepted, so "Retry" (or "Retry via secondary provider")
       starts the next attempt, with no edit needed;
-    - after `SENT_PARTIAL`: "retry rejected only", with an envelope of just those addresses;
+    - while delivery is `SENT_PARTIAL` with rejected recipients outstanding: "retry rejected
+      only", with an envelope of just those addresses. This works **whatever the filing
+      status** (`FILING`, `FILED` or `DONE`), and it reuses the existing Sent copy rather
+      than filing another;
     - after `UNCERTAIN`: **never automatically**. Only your explicit "I've checked, resend
       anyway", which warns that it may duplicate.
 
@@ -619,9 +627,15 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
   dispatch, so the worker that holds it is the only one that may submit. The lease decides
   *who* may send. It is never used to *retry*: an expired `SENDING` lease becomes
   `UNCERTAIN` (§4.6).
-- **Partial sends:** `SENT_PARTIAL` (§4.6) follows the same path as `SENT` (filing, draft
-  deletion). Its "retry rejected only" attempt is keyed by the dispatch and the rejected set,
-  so it is idempotent in the same way, and it submits the stored outbound MIME.
+- **Partial sends:** `SENT_PARTIAL` (§4.6) runs filing and draft deletion just like `SENT`,
+  but its delivery status stays `SENT_PARTIAL` until every rejected recipient has been
+  retried successfully or you dismiss them.
+  - Its "retry rejected only" attempt is keyed by the dispatch and the rejected set, so it
+    is idempotent in the same way, and it submits the stored outbound MIME.
+  - A successful retry updates `acceptedRcpts`/`rejectedRcpts` and the delivery status,
+    without touching the filed Sent copy.
+  - The dispatch counts as resolved, so its stored MIME can be deleted, only when filing is
+    `DONE` *and* no rejected recipient is outstanding.
 - **Write-ahead:** `SENDING`, with the outbound Message-ID, is committed before submission,
   and `SENT` right after the 2xx. The only window where the outcome is unknown is between
   those two commits, and it always resolves to `UNCERTAIN`. So "never send twice" (G5) holds
@@ -677,7 +691,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `sendAfter`, `nextStepAt`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `state`, `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `sendAfter`, `nextStepAt`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
