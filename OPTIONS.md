@@ -24,9 +24,12 @@ build-it-ourselves path in detail.
   service sends the draft through smtp2go or forwardemail and files a Sent copy back into the
   Gmail thread. Gmail stays the store, the Gmail apps stay the UI, and work and home share
   one interface.
-- **Zero-tap alternative, more invasive:** a reverse-alias relay, bought (addy.io,
-  SimpleLogin) or built. Gmail's normal *Reply* goes through a relay address on your domain,
-  but every inbound message has to be rewritten.
+- **Ruled out: reverse-alias relays** (addy.io, SimpleLogin, or our own). They'd give
+  zero-tap replies, but only by putting a rewriter in the path of every incoming email, so
+  any bug or outage means mail you never see (R7, Option 3).
+- **Test first, 15 minutes:** the Gmail Android app can still add non-Google IMAP/SMTP
+  accounts. If one that points back at your own Gmail can send via smtp2go (Option 4, E2),
+  Android needs no code at all, and the Outbox shrinks to a web-only helper.
 - **Free fallback:** send from @gmail.com, optionally with Reply-To set to the domain
   address, plus a small exception path for the services that require the registered address.
   Option 0 below covers what that looks like and what it costs you.
@@ -107,6 +110,14 @@ Must:
   email). No other Google account, Workspace tenant or Cloud Identity tenant may own the
   address or the domain. Otherwise people share with two "you"s and the Google identity
   splits.
+- **R7** Nothing invasive on a critical path.
+  - Inbound mail never passes through anything we build or a third party rewrites: Forward
+    Email forwards straight into Gmail, as today.
+  - On the outbound side, a failure must be visible and safe: the draft stays in Gmail, you
+    get told, and Gmail's own Send still works.
+  - Background tidying of your own sent copies, like the optional Sent fixer (DESIGN.md
+    §4.7), is allowed only if it is opt-in, narrowly matched, off the critical path and
+    recoverable: Trash, never hard delete.
 
 Should:
 
@@ -245,52 +256,26 @@ The build-our-own option; full design in [DESIGN.md](DESIGN.md).
   - Some API behaviours need confirming (§7, E3).
 - **Effort:** a usable Android loop in roughly 2–3 weekends; the web extension about 1–2 more.
 
-### Option 3 — Reverse-alias relay (buy or build)
+### Option 3 — Reverse-alias relay: rejected
 
-**How it works.** Inbound mail is rewritten so every other party appears as a relay address
-on your side, for example `me+alice=example.org@example.net`. Pressing Gmail's normal
-*Reply* or *Reply all* sends from `me@gmail.com` to those relay addresses. The relay then:
+**What it is.** It's how SimpleLogin and addy.io work, or we could build one on Forward Email
+webhooks.
 
-1. checks the message really came from your Gmail (DKIM `d=gmail.com`, DMARC pass);
-2. rewrites From to `me@example.net` and maps the relay addresses back to the real ones;
-3. strips identifying headers;
-4. sends it on.
+1. Inbound mail is rewritten so each sender appears as a relay address, e.g.
+   `alice=example.org@r.example.net`.
+2. Gmail's normal Reply goes to that address.
+3. The relay swaps in `From: me@example.net` and sends it on.
 
-**3a. Buy it.**
+It's the only option with zero extra taps.
 
-- **addy.io** Pro (~$36/yr) puts relay addresses **on your own domain**. New contacts are
-  written as `me+bob=example.org@example.net`. It gates replies on DMARC, strips your Gmail
-  address and builds a fresh Message-ID. Limits: 200 replies/day, 25 MB per message (doc).
-  Lite ($12/yr) is too small for a primary address.
-- **SimpleLogin** Premium (~$30–36/yr) does the same, but relay addresses are always
-  `@simplelogin.co` (only you see them). New contacts need a contact created in its app first
-  (doc).
-- Either one needs the domain's MX moved from Forward Email to them, or the use of a
-  subdomain.
+**Rejected because it violates R7.** Every incoming email has to pass through the rewriter
+before Gmail sees it. A bug, outage, misjudged authentication check or vendor problem means
+mail that silently never arrives. It also:
 
-**3b. Build it** on Forward Email webhooks, with no MX change. This is the optional phase of
-DESIGN.md (§10). A regex alias catches relay addresses and posts them to a webhook, with the
-raw message and DKIM/SPF/DMARC results. Our relay verifies, rewrites and sends. Inbound mail
-for `me@example.net` is rewritten and delivered via Gmail API `messages.import`, which applies
-Gmail's normal spam classification.
-
-**Day to day:** the native Send button, zero extra taps for replies. Brand-new recipients need
-an encoded address or a pre-created contact.
-
-**Pros:** truly native UX (N1); works in any client, including the Gmail Android app and the
-web.
-
-**Cons:**
-
-- **Inbound is rewritten.**
-  - The original From DKIM is broken, so Gmail judges mail by the relay's reputation.
-  - Spam filtering, sender avatars/BIMI and one-click unsubscribe degrade.
-  - Contacts and autocomplete fill up with relay addresses.
-- **The leak problem:** any recipient that *isn't* a relay address gets your mail straight
-  from `me@gmail.com`, which leaks the Gmail address. For example: a stale autocomplete entry,
-  or someone you added by hand.
-- **Calendar:** RSVPs bypass the relay (untested).
-- **Lock-in (buy):** with a bought relay, your inbound mail depends on that vendor.
+- weakens Gmail's spam filtering, because the original sender's DKIM no longer verifies;
+- breaks sender photos and unsubscribe;
+- fills autocomplete with relay addresses;
+- still leaks `me@gmail.com` whenever you type someone's real address.
 
 ### Option 4 — Gmail Android app: domain identity as an "Other" IMAP account
 
@@ -316,7 +301,9 @@ drafts.
   found.
 - The From switch may not work across accounts on a reply.
 - The sent copy may land in a new "Sent" label rather than Gmail's real Sent Mail: AOSP
-  Email, the app's ancestor, looks for a folder literally named "Sent" (reported).
+  Email, the app's ancestor, looks for a folder literally named "Sent" (reported). If so, the
+  optional Sent fixer (DESIGN.md §4.7) can re-file those copies. If the app saves no copy at
+  all, nothing can.
 - A duplicate account sits in the account switcher.
 - App passwords are unavailable with Advanced Protection.
 - Android only; web needs something else.
@@ -404,8 +391,7 @@ of replies, collapsing your own list echoes, and reply nudges.
 |---|---|---|---|
 | 0 / 0b @gmail.com | Gmail | ✓ | ✓ |
 | 2 mmail Outbox | mmail, at send time | ✓ if one of the strategies in [DESIGN.md §4.7](DESIGN.md#47-sent-copies-special-handling) works (E3b) | ✓, or From shows `me@gmail.com` under the fallback |
-| 3 Relay | Gmail | ✓ | ✗ shows From `me@gmail.com`, To relay addresses |
-| 4 Gmail app IMAP identity | the app, via IMAP APPEND | maybe: it may create a "Sent" user label instead (E2) | ✓ |
+| 4 Gmail app IMAP identity | the app, via IMAP APPEND | maybe: it may create a "Sent" user label instead (E2); the Sent fixer can re-file those | ✓ |
 | 7 FairEmail / Thunderbird | the client, via IMAP APPEND | ✓ once pointed at `[Gmail]/Sent Mail` | ✓ |
 | 9 Domain mailbox at provider | the provider | ✗ only the provider's Sent, unless synced | ✓ |
 
@@ -417,7 +403,6 @@ them, ranked roughly by how close they stay to today.
 | # | Workflow | Android | Desktop web | Extra effort per domain email | Built from |
 |---|---|---|---|---|---|
 | B | **Draft then dispatch** | Gmail app → back → tap notification | Gmail web → "Send as" button | +1 tap | 2 (+5a) |
-| C | **Reply via relay** | Gmail app, normal Reply/Send | Gmail web, normal Reply/Send | 0 for replies; encoded address for new contacts | 3a or 3b |
 | D | **Two-account Gmail app** | Gmail app, switch From to the IMAP identity | Thunderbird or Forward Email webmail for domain sends | +2 taps on Android; another app on desktop | 4 (+7) |
 | E | **Domain on demand** | Gmail app sends as @gmail.com; FairEmail for the occasional domain send | Gmail web; Thunderbird or webmail for domain sends | 0 normally; switch apps when it matters | 0b + 7 |
 | F | **Gmail address, domain replies** | Gmail app as @gmail.com with Reply-To domain | same | 0 | 0 |
@@ -426,8 +411,8 @@ them, ranked roughly by how close they stay to today.
 
 Notes:
 
-- **B and C combine.** C handles zero-tap *replies*; B handles new mail and anything C can't
-  map. This is the "best of both" end state if the relay's inbound trade-offs prove acceptable.
+- **B and D combine.** If E2 passes, D covers Android natively and B's extension covers the
+  web. That's the likely end state.
 - **E and F** are where you land if you build nothing. E keeps sender-matched systems working
   at the cost of an occasional app switch. F is the simplest, with the downsides in Option 0.
 - **D's desktop half** can be swapped for B's web extension later.
@@ -449,8 +434,7 @@ Notes:
 | 1a Workspace identity | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | none | ~$84/yr | **rejected: splits Google identity (R6)** |
 | 1b Move to Workspace | ✓ | ✓ | ✓ | ✗ | ~ | ✓ | migration | ~$84/yr | **rejected: splits Google identity (R6)** |
 | 2 mmail Outbox | ~ (+1 tap) | ✓ (with ext) | ✓ | ✓ | ✓ | ✓ | medium | ~$0 | medium (our service, API quirks) |
-| 3a Relay, bought | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | none | $30–36/yr | medium (vendor; leaks) |
-| 3b Relay, built | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | medium–high | ~$0 | medium–high |
+| 3 Relay (bought or built) | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | none / medium–high | $0–36/yr | **rejected: rewriter on the inbound path (R7)** |
 | 4 Gmail app IMAP identity | ~ (+2 taps) | ✗ | ~ | ✓ | ~ | ✓ | none | $0 | **unknown until E2** |
 | 5 Extension alone | ✗ | ✓ | ~ | ✓ | ✓ | ✓ | low–medium | ~$0 | medium (Gmail DOM) |
 | 7 FairEmail + Thunderbird | ~ (2nd app) | ~ (desktop) | ✗ | ✓ | ✗ in those apps | ✓ | none | $0–small | low |
@@ -475,23 +459,29 @@ Notes:
 **Then:**
 
 ```
-Build mmail Outbox (Option 2): Android first, web extension second.
-│   Interim until it ships, and fallback if it slips past January:
-│   E2 if it passed, else FairEmail (Android) + Thunderbird (desktop)
-│   for domain sends — workflow D or E.
-├─ Want zero-tap replies too? Trial addy.io Pro (3a) on a subdomain or a
-│   secondary address (E4). If the inbound trade-offs are OK, adopt it,
-│   or build 3b later.
-└─ Decide not to run anything? Workflow E (hybrid) or F (Reply-To), using
-    the E0 inventory to update the services that check your sender address.
+E2 passes (Gmail app sends as the domain via an "Other" IMAP account)?
+├─ yes → Android: Option 4, native inside the Gmail app (workflow D).
+│        Web: mmail in web-only mode — the extension plus a small dispatch
+│        endpoint; no draft watching, no notifications (DESIGN.md §3).
+│        Until that ships: Thunderbird or Forward Email webmail.
+└─ no  → Android: full mmail Outbox with notifications (workflow B).
+         Web: the same backend plus the extension.
+         Until it ships: FairEmail (Android) + Thunderbird (desktop),
+         i.e. workflow E.
+
+Decide not to run anything? Workflow E (hybrid) or F (Reply-To), using the
+E0 inventory to update the services that check your sender address.
 ```
 
-**Why this order.** With Workspace ruled out (R6), nothing Google-native keeps the domain as
-a sending identity without splitting the Google account. Option 2 is the best thing we can
-build: it keeps Gmail as both store and UI, leaves inbound mail untouched, and puts the only
-friction (one tap) where it's visible and controllable. A relay is the only way to get *zero*
-friction, but it changes how every inbound message looks. It should be tried before it's
-trusted with the primary address.
+**Why this order.**
+
+- Workspace is ruled out (R6) and relays are ruled out (R7). That leaves no Google-native or
+  zero-tap way to keep the domain as a sending identity.
+- Option 4 is the least janky Android path, if Gmail allows it: two taps, all inside the
+  Gmail app.
+- The Outbox is the fallback for Android and the way to make the web feel native. Neither
+  touches inbound mail. If either fails, the draft stays in Gmail and Gmail's own Send still
+  works.
 
 ## 7. Experiments to run before January 2027
 
@@ -499,9 +489,9 @@ trusted with the primary address.
 |---|---|---|---|
 | **E0** | Inventory of domain sending | Google Takeout → Mail → only the *Sent* label (mbox), then a local script (no OAuth needed). Alternatively Gmail search `in:sent from:(*@example.net)`. Count messages and recipients per domain over 1/3/10 years; flag helpdesk domains (zendesk.com, freshdesk.com, helpscoutapp.com, service-now.com, atlassian.net…), list traffic (List-Id on received mail) and ingest addresses. | A CSV of "who knows me only as @example.net" and "who checks my sender address". |
 | ~~E1~~ | ~~Consumer → Workspace Send-as~~ | Dropped: Option 1 is rejected (R6). Don't verify the domain with Workspace even for a trial. | — |
-| **E2** | Gmail app IMAP identity | On Android, set up as in Option 4. Reply to a thread in the Google account, switch From, Send. | The app accepts `imap.gmail.com`. The reply is delivered from `me@example.net` with DKIM pass. The sent copy shows in the *same Gmail thread* and in Gmail's Sent (or at least in All Mail under a "Sent" label). |
+| **E2** | Gmail app IMAP identity | On Android, set up as in Option 4. Reply to a thread in the Google account, switch From, Send. | The app accepts `imap.gmail.com`. The reply is delivered from `me@example.net` with DKIM pass. The sent copy shows in the *same Gmail thread* and in Gmail's Sent. Record exactly where it lands: the real Sent, another label (fixable by the Sent fixer), or nowhere (Option 4 then has no Sent copy). |
 | **E3** | Gmail API behaviours (for Option 2) | With a throwaway OAuth client: (a) `drafts.get format=raw` on a reply drafted in the Android app — does it carry In-Reply-To/References? (b) the Sent filing strategies S1–S5 in DESIGN.md §4.7 (`mmail doctor`): which ones give `SENT`, thread, and show as "me"? Run now and again after the January cutover. (c) `watch` with `labelIds:[DRAFT]` — latency after leaving compose on Android; how often web autosave fires. (d) Does smtp2go keep our Message-ID? (e) Does `messages.send` rewrite a non-alias From? | (a)–(d) behave as DESIGN.md assumes; any deviation is noted there. |
-| **E4** | Reverse-alias trial (optional) | addy.io Pro on a subdomain such as `r.example.net`, or on a secondary address; live with it for two weeks. | Spam leakage, Gmail rendering and autocomplete pollution are tolerable. |
+| ~~E4~~ | ~~Reverse-alias trial~~ | Dropped: Option 3 is rejected (R7). | — |
 
 ## 8. Open questions
 
