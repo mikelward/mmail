@@ -287,6 +287,14 @@ attachments and inline `cid:` images, pass through untouched.**
   - 5xx before `DATA` → `FAILED`, and the draft is kept.
   - Timeout or connection loss after `DATA` → **`UNCERTAIN`**. Never auto-retry; ask the user,
     because a duplicate is worse than a delay.
+  - The process dies mid-submission. The provider may already have answered 2xx, but `SENT`
+    was never committed. When the `SENDING` lease expires with no result recorded, recovery
+    moves the dispatch to **`UNCERTAIN`**, never back to sending. This works because
+    `SENDING` and the outbound Message-ID are committed *before* the first byte goes to the
+    provider, so recovery always knows a submission may have happened.
+  - **Resolving `UNCERTAIN`:** if the provider exposes a searchable send log (smtp2go's
+    activity search, Forward Email's emails API; untested), recovery looks up our Message-ID
+    and resolves to `SENT` or `FAILED` automatically. Otherwise you decide.
 - **DNS:** unchanged from today's Send-as setup: provider DKIM, and SPF or a custom
   return-path. Once mmail is the only outbound path, consider moving DMARC to `p=quarantine`.
 - **Provider limits:** smtp2go free is 1,000/month and 200/day (25/hour until the domain is
@@ -454,13 +462,20 @@ OFFERED ──confirm──► CONFIRMED ──undo window──► SENDING ─�
    │                    │ undo                     │ 5xx            │ insert fails         │ draft edited
    ▼                    ▼                          ▼                ▼ (retry w/ backoff)   ▼
 WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED          DONE_KEPT_DRAFT
-                                                   │ timeout after DATA
+                                                   │ timeout after DATA, or
+                                                   │ lease expired with no result
                                                    ▼
-                                               UNCERTAIN (user decides)
+                                               UNCERTAIN (provider log lookup, else user decides)
 ```
 
 - **Lease:** each transition is a Firestore transaction. `SENDING` takes a lease keyed by
-  `draftId`, so two taps (notification plus extension) can't both send.
+  `draftId`, so two taps (notification plus extension) can't both send. The lease decides
+  *who* may send. It is never used to *retry*: an expired `SENDING` lease becomes
+  `UNCERTAIN` (§4.6).
+- **Write-ahead:** `SENDING`, with the outbound Message-ID, is committed before submission,
+  and `SENT` right after the 2xx. The only window where the outcome is unknown is between
+  those two commits, and it always resolves to `UNCERTAIN`. So "never send twice" (G5) holds
+  by construction, at the cost of occasionally asking you.
 - **Pre-send check:** at the start of `SENDING`, re-fetch the draft and require
   `messageId == confirmed messageId`. Otherwise go back to `OFFERED` and re-notify with "Draft
   changed — review".
@@ -535,6 +550,8 @@ Firestore (Native mode), single user:
 - **Chaos:**
   - kill the server between `SENT` and `FILED`, then restart, and confirm there's no
     duplicate send;
+  - kill the server after the provider's 2xx but before `SENT` is committed, and confirm the
+    dispatch ends in `UNCERTAIN` (or is resolved from the provider log), never resent;
   - edit the draft during the undo window;
   - drop Pub/Sub messages and confirm reconcile catches up.
 
@@ -543,9 +560,17 @@ Firestore (Native mode), single user:
 - **Google's warning** in its help article is about handing *third parties* your credentials
   or tokens. mmail is first-party: your project, your token, your provider account. Only you
   can trigger a send, and only for your own drafts.
-- **Blast radius of a server compromise:** read your drafts and message *headers*, insert
-  messages, and send mail as `me@example.net` (provider credential) or as `me@gmail.com`
-  (`gmail.compose`). It can't read message bodies. Mitigations:
+- **Blast radius of a server compromise.** An attacker could:
+  - **read any draft in full**, bodies and attachments included. `gmail.compose` allows
+    `drafts.get(format=raw)`, which mmail itself uses (§4.5);
+  - read the *headers* of every other message (`gmail.metadata`);
+  - insert messages into your mailbox;
+  - send mail as `me@example.net` (provider credential) or as `me@gmail.com`
+    (`gmail.compose`).
+
+  It can't read the bodies of non-draft messages. The exception is the optional Sent fixer:
+  its `gmail.modify` grant can read and trash any message, so that token lives in its own
+  secret, readable only by the fixer job (§4.7). Mitigations:
   - narrow scopes;
   - Secret Manager with a dedicated service account;
   - no public endpoints except `/pubsub` (OIDC-verified), the authenticated API and the
@@ -572,6 +597,7 @@ Firestore (Native mode), single user:
 | Refresh token revoked (password change) | token refresh fails | health alert via Web Push; re-auth link in PWA; Gmail's own Send still works |
 | Provider down or rejecting | 4xx/5xx | `FAILED`; draft kept; "Retry" / "Retry via secondary provider" |
 | Timeout after DATA | socket error | `UNCERTAIN`; never auto-retried; user checks recipient/provider log |
+| Process dies mid-submission (the provider may have accepted) | `SENDING` lease expires with no result | `UNCERTAIN`; resolved from the provider's send log by Message-ID if available, else you decide; never resent automatically |
 | Insert fails | API error | retry with backoff → `SENT_UNFILED` + alert; mail *was* sent |
 | Copy filed but without `SENT` (Gmail behaviour changed, e.g. at the January cutover) | label read-back after filing | alert: re-run `mmail doctor` and re-pin `sent_strategy`; no automatic second filing |
 | Draft delete fails after a successful send | API error | leftover-draft warning in the notification; retried on every reconcile |
