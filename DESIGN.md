@@ -683,21 +683,25 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
   draft version (a new tap or click) moves the existing dispatch from `CANCELLED` back to
   `CONFIRMED` with a fresh undo window and the next `confirmation` number. No draft edit is
   needed. It's still one dispatch per draft version, so the uniqueness guard holds.
-- **Every confirmation is one-time.** Each one carries a `confirmationId` (a random
-  nonce), which the server records as consumed on the dispatch. The nonce comes from one of
-  two places:
-  - the server mints it into each notification action token;
-  - the PWA or extension generates it at the moment you tap or click.
+- **Every confirmation uses a server-issued, generation-bound, one-time token.** Clients
+  never mint their own.
+  - Notification actions carry one.
+  - The PWA and extension fetch one (`GET /dispatch/{draftId}/token`) when they show the
+    Send button, and fetch a new one whenever the dispatch changes.
+  - Each token binds `draftId`, `draftMessageId`, identity, the current `confirmation`
+    generation, a server nonce and an expiry (§4.8).
 
-  Rules:
-  - A request whose `confirmationId` is already consumed (a delayed duplicate, a retried
-    HTTP call, a replayed token) **only returns the dispatch's current state**. It never
-    changes it.
-  - Each token is also bound to the `confirmation` generation it was issued for.
-    **Reconfirming a `CANCELLED` dispatch needs a nonce minted *after* the cancellation:**
-    the Undo notification offers a fresh "Send anyway" token for the next generation, or
-    you tap again in the PWA or extension. So a stale request from before Undo can never
-    reverse it.
+  `/dispatch` applies it in one transaction:
+  - **Wrong generation:** if the token's generation isn't the dispatch's *current* one, the
+    request only returns the current state. This covers anything issued before an Undo,
+    from any client, however many clicks were in flight.
+  - **Already used:** if the token's nonce is already consumed (a delayed duplicate, a
+    retried call, a replayed token), it also only returns the current state.
+  - **Otherwise** the transition happens and the nonce is consumed.
+
+  Undo increments the generation. So **reconfirming a `CANCELLED` dispatch needs a token
+  the server issued after the cancellation**: the Undo notification's fresh "Send anyway"
+  action, or a new tap in a PWA or extension view that has fetched a new token.
 - **Every transition persists its next step.** Each state commit also writes `nextStepAt`.
   The Cloud Task for that step has a deterministic name (`dispatchId-state-attempt`), so a
   process can die between the commit and task creation without stranding the dispatch.
