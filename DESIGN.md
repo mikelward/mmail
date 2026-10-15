@@ -597,10 +597,10 @@ Limits:
     worker **sends the expired token itself** to `POST /dispatch/{draftId}/token/refresh`,
     authenticated with its device credential, then posts the fresh token it gets back.
     - The server verifies the expired token's signature (ignoring only its expiry). It then
-      compares the token's own `draftMessageId` and generation with the current ones. Only
-      if both match does it mint a fresh token with the same action, target, version,
-      generation and identity.
-    - If either changed meanwhile, for example the draft was edited or an Undo advanced
+      compares the token's own `draftMessageId`, generation and action target (§4.10) with
+      the current ones. Only if all match does it mint a fresh token with the same action,
+      target, version, generation and identity.
+    - If any changed meanwhile, for example the draft was edited or an Undo advanced
       the generation and the replacement push was delayed or dropped, nothing is minted.
       The server returns the current state and the notification is updated instead.
       Refreshing a stale notification can never produce a token for content you didn't
@@ -783,9 +783,14 @@ with `draftKept` set.
      edited or deleted. If history has expired, so reconciliation can't be done, or the
      stored bytes are gone, alert rather than guess. A duplicate Sent copy is cosmetic, but
      it's still avoided.
-- **Pre-send check:** before committing `SENDING`, re-fetch the draft and require
-  `messageId == confirmed messageId`. If it differs, or the draft is gone, nothing has been
-  stored or submitted yet:
+- **Pre-send check:** only on the **first submission of a confirmation** (`CONFIRMED` →
+  `SENDING`), re-fetch the draft and require `messageId == confirmed messageId`.
+  - Every later attempt submits the stored MIME and never consults the draft. That covers
+    "Retry" after `FAILED`, "retry rejected only", "Resend anyway", and `RETRY_WAIT` →
+    `SENDING`. A normal `SENT_PARTIAL` dispatch has already deleted its draft by then.
+
+  If the message ID differs, or the draft is gone, nothing has been stored or submitted
+  yet:
   - This dispatch moves to the **terminal** `WITHDRAWN`. It's keyed to a draft version that
     no longer exists, so nothing could ever confirm it again, and it must not sit in a
     non-terminal state for the sweep to chase.
@@ -829,7 +834,11 @@ with `draftKept` set.
     - for a retry (including `resend-uncertain`), the attempt number it creates, plus the
       hash of the recipient set for `retry-rejected`;
     - for `dismiss-rejected`, that recipient-set hash;
-    - for `mark-delivered` and `abandon`, the `UNCERTAIN` attempt they resolve.
+    - for `mark-delivered` and `abandon`, the `UNCERTAIN` attempt they resolve;
+    - for `retry-filing` and `close`, the current **`filingCycle`**. It's incremented each
+      time filing enters `UNFILED`. A token from an earlier `UNFILED` episode no longer
+      matches, so after one client's "Retry filing" fails again, another client's unused
+      token can't retry or close the new failure without being reissued.
 
     The server stores the action and target with the nonce, and each endpoint accepts only
     tokens for its own action and the current target. A mismatch is rejected without consuming the nonce. So when "Retry filing" and
@@ -907,7 +916,8 @@ with `draftKept` set.
     - **`FILED`** → delete the draft (retried).
     - **`DONE`** → nothing. A `SENT_PARTIAL` dispatch stays non-terminal while rejections
       are outstanding, but that never triggers filing again; only its retry actions remain;
-    - **`UNFILED`** → nothing. Filing moves here when its retries are exhausted. The track
+    - **`UNFILED`** → nothing. Filing moves here, incrementing `filingCycle`, when its
+      retries are exhausted. The track
       is parked (no `nextStepAt`), the draft is kept (file first, then delete), and you're
       alerted.
       - **"Retry filing"** (a one-time token action like the others) moves it back to
@@ -940,7 +950,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `attempt` (per attempt: envelope, result, and its track's `nextStepAt`, `scheduleGen`, `lastEnqueuedAt` and lease), `filingTrack` (`nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, lease), `acceptedRcpts`, `rejectedRcpts`, `dismissedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `draftKept`, `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `attempt` (per attempt: envelope, result, and its track's `nextStepAt`, `scheduleGen`, `lastEnqueuedAt` and lease), `filingTrack` (`nextStepAt`, `scheduleGen`, `lastEnqueuedAt`, lease, `filingCycle`), `acceptedRcpts`, `rejectedRcpts`, `dismissedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `draftKept`, `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
