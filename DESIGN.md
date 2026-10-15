@@ -306,8 +306,8 @@ attachments and inline `cid:` images, pass through untouched.**
    subject you edited. Its outbound threading headers are kept as Gmail wrote them, so
    recipients still see the relationship, but the sent copy is filed without `threadId`. If
    an insert *with* `threadId` is still rejected as a threading mismatch, the filer
-   reconciles (§4.10), then re-files without `threadId`, rather than leaving it
-   `SENT_UNFILED`.
+   reconciles (§4.10), commits the switch (`filingMode: unthreaded`), and then re-files
+   without `threadId`, rather than leaving it `SENT_UNFILED`.
    - **New messages** get no threading headers. Their sent copy is filed **without**
      `threadId` (§4.7), so Gmail starts a fresh thread. Gmail's threading rules need a
      parent for `In-Reply-To`/`References`, so filing a new message into its draft thread
@@ -654,10 +654,11 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
   response or a crash before `FILED` is committed could otherwise file a second copy.
   1. Before filing, commit `FILING` together with the current mailbox `historyId`.
   2. On recovery from `FILING`, or after an ambiguous error, **reconcile before retrying**.
-     Look for a message whose `X-Mmail-Dispatch` header is ours: in the draft's thread
-     (`threads.get` with metadata headers), or, for a new thread, among `messageAdded`
-     entries since the recorded `historyId` (`history.list`). Both work under
-     `gmail.metadata`.
+     Look for a message whose `X-Mmail-Dispatch` header is ours **among all `messageAdded`
+     entries since the recorded `historyId`** (`history.list`). That finds the copy
+     whichever thread it landed in, including an unthreaded fallback whose response was
+     lost. When `filingMode` is `threaded`, the draft's thread is checked first as a fast
+     path (`threads.get` with metadata headers). Both work under `gmail.metadata`.
   3. If one is found, move to `FILED` with that message ID. If none is found, retry the
      insert **with the stored sent-copy bytes**, never the current draft, which may have been
      edited or deleted. If history has expired, so reconciliation can't be done, or the
@@ -688,7 +689,11 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
     copy and draft deletion, so a leftover draft can't be sent again by hand;
   - `FILING` → reconcile, then file;
   - `FILED` → delete the draft (retried);
-  - `SENDING` with an expired lease → `UNCERTAIN`.
+  - **any attempt** that is `SENDING` with an expired lease → that attempt becomes
+    `UNCERTAIN`. This is checked per attempt, **before and independently of** the
+    dispatch's aggregate delivery and filing status. A crashed rejected-only retry under a
+    `SENT_PARTIAL` dispatch whose filing is already `DONE` is still caught, and can't hold
+    its lease forever.
 
   It also raises the unresolved-dispatch alerts. Deterministic task names keep all of this
   idempotent.
@@ -701,7 +706,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `sendAfter`, `nextStepAt`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `sendAfter`, `nextStepAt`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
