@@ -293,8 +293,13 @@ attachments and inline `cid:` images, pass through untouched.**
     `SENDING` and the outbound Message-ID are committed *before* the first byte goes to the
     provider, so recovery always knows a submission may have happened.
   - **Resolving `UNCERTAIN`:** if the provider exposes a searchable send log (smtp2go's
-    activity search, Forward Email's emails API; untested), recovery looks up our Message-ID
-    and resolves to `SENT` or `FAILED` automatically. Otherwise you decide.
+    activity search, Forward Email's emails API; untested), recovery looks up our Message-ID.
+    - **A positive record** of it means the provider accepted the message, so it resolves to
+      `SENT`.
+    - **No record, an unavailable log, or anything inconclusive leaves it `UNCERTAIN`.**
+      Logs can lag or be incomplete even after acceptance, so a missing record never becomes
+      `FAILED` and never triggers a resend. You decide, and recovery can re-check the log
+      later.
 - **DNS:** unchanged from today's Send-as setup: provider DKIM, and SPF or a custom
   return-path. Once mmail is the only outbound path, consider moving DMARC to `p=quarantine`.
 - **Provider limits:** smtp2go free is 1,000/month and 200/day (25/hour until the domain is
@@ -476,6 +481,17 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
   and `SENT` right after the 2xx. The only window where the outcome is unknown is between
   those two commits, and it always resolves to `UNCERTAIN`. So "never send twice" (G5) holds
   by construction, at the cost of occasionally asking you.
+- **Filing is write-ahead too.** `messages.insert`/`import` has no idempotency key, so a lost
+  response or a crash before `FILED` is committed could otherwise file a second copy.
+  1. Before filing, commit `FILING` together with the current mailbox `historyId`.
+  2. On recovery from `FILING`, or after an ambiguous error, **reconcile before retrying**.
+     Look for a message whose `X-Mmail-Dispatch` header is ours: in the draft's thread
+     (`threads.get` with metadata headers), or, for a new thread, among `messageAdded`
+     entries since the recorded `historyId` (`history.list`). Both work under
+     `gmail.metadata`.
+  3. If one is found, move to `FILED` with that message ID. If none is found, retry the
+     insert. If history has expired, so reconciliation can't be done, alert rather than
+     guess. A duplicate Sent copy is cosmetic, but it's still avoided.
 - **Pre-send check:** at the start of `SENDING`, re-fetch the draft and require
   `messageId == confirmed messageId`. Otherwise go back to `OFFERED` and re-notify with "Draft
   changed — review".
@@ -489,7 +505,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{id}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `rcptCount`, `provider`, `providerRef`, `state`, `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, timestamps |
+| `dispatches/{id}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `rcptCount`, `provider`, `providerRef`, `state`, `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
@@ -598,7 +614,7 @@ Firestore (Native mode), single user:
 | Provider down or rejecting | 4xx/5xx | `FAILED`; draft kept; "Retry" / "Retry via secondary provider" |
 | Timeout after DATA | socket error | `UNCERTAIN`; never auto-retried; user checks recipient/provider log |
 | Process dies mid-submission (the provider may have accepted) | `SENDING` lease expires with no result | `UNCERTAIN`; resolved from the provider's send log by Message-ID if available, else you decide; never resent automatically |
-| Insert fails | API error | retry with backoff → `SENT_UNFILED` + alert; mail *was* sent |
+| Insert fails, or its outcome is unknown (lost response, crash before `FILED`) | API error or a dispatch left in `FILING` | reconcile by `X-Mmail-Dispatch` (thread or history since the recorded `historyId`) before any retry (§4.10); then retry with backoff → `SENT_UNFILED` + alert; mail *was* sent |
 | Copy filed but without `SENT` (Gmail behaviour changed, e.g. at the January cutover) | label read-back after filing | alert: re-run `mmail doctor` and re-pin `sent_strategy`; no automatic second filing |
 | Draft delete fails after a successful send | API error | leftover-draft warning in the notification; retried on every reconcile |
 | Draft edited after confirm | message ID mismatch | send is blocked and re-offered; if after send, draft kept |

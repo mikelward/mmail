@@ -65,7 +65,9 @@ These are the point of the design.
 
 1. **Never accept-then-drop.** A message is either refused during the SMTP conversation, so
    the sender's server bounces it and the sender knows, or delivered into Gmail, possibly to
-   Spam. Nothing is silently discarded after a `250 OK`.
+   Spam. Nothing is silently discarded after a `250 OK`. That includes losing the machine:
+   a `250 OK` is only as good as the disk holding the queue, so the queue must survive the
+   host (rule 6).
 2. **Fail open on rewriting.** Postfix accepts and queues durably *before* our code runs
    (after-queue content filter). If the rewriter crashes or can't parse a message, it stays
    queued and is retried. After N attempts or 30 minutes it is delivered **unmodified** and
@@ -81,6 +83,16 @@ These are the point of the design.
 5. **Rewrite only what authenticates.** Inbound mail is rewritten only when the sender passes
    DMARC or aligned DKIM. Everything else is delivered unmodified, with a header saying so.
    No relay address is ever minted for a forged sender.
+6. **Accepted mail survives losing the host.** Rebuilding the VM from config doesn't bring
+   back messages that were already accepted but not yet delivered. So:
+   - **The Postfix queue lives on a synchronously replicated disk** (e.g. a Google Cloud
+     regional persistent disk, replicated across two zones). It's reattached to a
+     replacement VM, which then finishes delivering whatever was in flight.
+   - **For a stronger guarantee,** a before-queue proxy (`smtpd_proxy_filter`) writes each
+     raw message to multi-zone object storage *before* Postfix answers `250 OK`. After an
+     unrecoverable loss, the journal is replayed, with delivery de-duplicated by Message-ID.
+   - **Queues normally drain in seconds,** so the exposed window is small; the canary
+     (§4) would notice a stuck queue.
 
 ### Components: assemble the boring parts, write the interesting ones
 
@@ -156,7 +168,7 @@ This is what makes it trustworthy rather than scary.
 | Spam false positive at SMTP time | Sender gets a bounce; you see it in the digest. Keep thresholds conservative: reject only high-confidence cases (Spamhaus ZEN listings, DMARC `p=reject` failures) and let Gmail classify the rest. | sender + digest |
 | Greylisting delays a legit first-time sender | 5–30 minute delay; senders retry automatically. | metrics |
 | smtp2go down | Replies wait in the Postfix queue. | alert |
-| VM disk or host dies | MX 20 takes over; rebuild from config (keep the mapping DB backed up). | canary alert |
+| VM disk or host dies | MX 20 takes over for new mail. The replicated queue disk is reattached to a replacement VM, which delivers already-accepted mail (or the journal is replayed; rule 6). The mapping DB is on the same replicated disk and backed up. | canary alert |
 | You pick a real address from autocomplete | Mail goes straight from `me@gmail.com`. The relay never sees it. | nobody (inherent, §1) |
 
 ## 6. Topology C extras: delivering outbound mail ourselves
