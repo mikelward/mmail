@@ -43,26 +43,31 @@ Non-goals:
 ### 2.1 Android: reply as the domain
 
 1. Open the thread in the Gmail app and tap **Reply**. Write it, optionally with Gemini.
-2. Instead of tapping Gmail's Send, tap **←** (back). Gmail shows "Draft saved".
-3. Within a few seconds a notification appears:
+2. **Arm it:** add `send@example.net` to Bcc. Autocomplete makes this a couple of
+   keystrokes. This is how you say "this draft is finished" (§4.3).
+3. Instead of tapping Gmail's Send, tap **←** (back). Gmail shows "Draft saved".
+4. Within a few seconds a notification appears:
 
    > **Send as me@example.net?**
    > To: Alice Smith (+1) · Re: Dinner on Saturday
-   > [ **Send** ] [ More… ]
+   > "Sounds good, see you at 7 … Cheers"
+   > [ **Send** ] [ Review… ]
 
-4. Tap **Send**. The notification becomes "Sending as me@example.net… [Undo]" for 10 seconds
-   (configurable), then "Sent ✓".
-5. Back in Gmail, the draft is gone and the reply sits in the thread as sent by
-   `me@example.net`.
+5. Tap **Send**. The notification becomes "Sending as me@example.net… [Undo]" for 10 seconds
+   (configurable), still showing the body's first and last lines, then "Sent ✓".
+6. Back in Gmail, the draft is gone and the reply sits in the thread as sent by
+   `me@example.net`. The arming address is stripped and never sent.
 
-*More…* opens the mmail PWA on that draft. There you can see the recipients, subject and a
-text preview, switch identity (`me@example.net`, `shop@example.net`, …, or "leave it, I'll
-send from Gmail"), and send.
+**If you skip step 2,** the notification only offers **Review…**. That opens the mmail PWA on
+the draft, showing the full body, attachments, recipients and identity picker
+(`me@example.net`, `shop@example.net`, …, or "leave it, I'll send from Gmail"), with a Send
+button there. A paused, half-written draft can never be sent from a notification you
+glanced at.
 
 ### 2.2 Android: new message
 
-Same flow. Compose a new message in Gmail, go back, tap the notification. The identity comes
-from recipient rules or the default (§4.4). By default mmail only offers notifications for
+Same flow. Compose a new message in Gmail, Bcc `send@example.net`, go back, tap the
+notification. The identity comes from recipient rules or the default (§4.4). By default mmail only offers notifications for
 drafts it thinks belong to the domain (§4.3), so new messages also need either policy `all`
 or a tap on the PWA's Outbox home-screen shortcut.
 
@@ -86,8 +91,9 @@ notification. Nothing else happens.
 ### 2.5 Pressing Gmail's Send on a domain thread by habit
 
 - **Android:** mmail can't stop it. After the fact it notices a `SENT` message from
-  `me@gmail.com` in a thread whose identity resolves to the domain, and it pushes a heads-up
-  so you can follow up.
+  `me@gmail.com` in a thread whose identity resolves to the domain, or one carrying the arming
+  address in Bcc (an armed draft sent the wrong way). It then pushes a heads-up so you can
+  follow up.
 - **Web:** the extension's guard prevents it.
 
 ## 3. Architecture
@@ -199,6 +205,31 @@ and Secret Manager.
   replaces it, and it is closed when the draft is deleted or sent from Gmail.
 - **Opting out:** you can silence a specific draft ("Not this one") or a thread.
 
+**Settled is not ready.** A draft that hasn't changed for a few seconds might be finished, or
+you might be reading, looking something up, or offline mid-sentence. Gmail's autosave makes
+both look the same. So **one-tap Send is offered only for *armed* drafts**. A settled
+draft that isn't armed gets a notification with only **Review…**, which opens the full draft in
+the PWA before anything can be sent.
+
+Arming signals, explicit and per platform:
+
+- **Web:** clicking the extension's **Send as** button (§4.9) is itself the signal; it
+  dispatches directly, with no notification. The extension also reports which drafts are open
+  in a compose window, and those are never offered by notification on any device.
+- **Android:** adding the **arming address** (`send@example.net`, configurable) to To/Cc/Bcc.
+  - It's an ordinary Forward Email alias that delivers to Gmail under a filter that archives
+    it, so nothing new sits on the inbound path.
+  - The transformer strips it from the headers and the envelope (§4.5).
+  - If Gmail's own Send is pressed on an armed draft by mistake, the resulting `SENT` message
+    from `me@gmail.com` carries the arming address in Bcc. mmail spots that and warns
+    (§2.5).
+- **Opt-in `trust_settle`:** for anyone who accepts the risk, a long settle (e.g. 60 s) counts
+  as armed. It's off by default.
+
+Even an armed draft is re-checked at send time: its message ID must equal the one you saw
+(§4.10). The Send and undo notifications show the body's first and last lines and the
+attachment count, so a truncated body is visible before the undo window closes.
+
 ### 4.4 Identity resolver
 
 Configuration:
@@ -215,6 +246,8 @@ rules:                        # recipient-based, first match wins
   - recipient_domain: [zendesk.com, freshdesk.com]
     identity: me@example.net
 fallback: ask                 # ask | default
+arming_address: send@example.net
+trust_settle: false           # true: a 60 s settle counts as armed (risky)
 ```
 
 Resolution order:
@@ -228,7 +261,7 @@ Resolution order:
      sender used, e.g. `amazon@example.net`.
    - Forward Email forwarding keeps the original `To`.
 3. **Recipient rules.**
-4. **Fallback**: `ask` shows the notification with no preselection (only *More…*); `default`
+4. **Fallback**: `ask` shows the notification with no preselection (only *Review…*); `default`
    preselects the default identity.
 
 ### 4.5 Message transformer
@@ -259,6 +292,8 @@ attachments and inline `cid:` images, pass through untouched.**
 6. **Envelope:**
    - `MAIL FROM` is the identity address. The provider rewrites Return-Path to its bounce
      domain or our custom return-path CNAME.
+   - The arming address (§4.3) is removed from `To`/`Cc`/`Bcc`, from the envelope, and from
+     the sent copy. A draft whose *only* recipient was the arming address is refused.
    - `RCPT TO` is the de-duplicated set of addresses in `To` + `Cc` + `Bcc`. Group syntax and
      encoded words are handled by the parser.
 7. **Limits:** refuse anything over 25 MB. Gmail already converts large attachments to Drive
@@ -426,11 +461,16 @@ Limits:
 
 - **Web Push (VAPID)** from the server to the PWA's service worker, which works in Android
   Chrome and desktop Chrome.
-  - The payload holds `draftId`, identity, a recipient summary, the subject, and a signed
-    **action token**: `HMAC(key, draftId | draftMessageId | identity | expiry)`, valid for
-    15 minutes.
-  - Actions: **Send** (posts the token to `/dispatch` in the background) and **More…** (opens
-    the PWA). Android shows two action buttons comfortably.
+  - The payload holds `draftId`, identity, a recipient summary, the subject, the body's
+    first and last lines, and the attachment count. For **armed** drafts only (§4.3), it also
+    carries a signed **action token**:
+    `HMAC(key, draftId | draftMessageId | identity | expiry)`, valid for 15 minutes.
+  - Actions:
+    - armed drafts: **Send** (posts the token to `/dispatch` in the background) and
+      **Review…** (opens the PWA);
+    - unarmed drafts: **Review…** only.
+
+    Android shows two action buttons comfortably.
 - **PWA screens:**
   - *Outbox*: settled drafts with identity picker, preview and Send.
   - *History*: dispatches with their state, plus "Open in Gmail" links.
@@ -618,6 +658,7 @@ Firestore (Native mode), single user:
 | Copy filed but without `SENT` (Gmail behaviour changed, e.g. at the January cutover) | label read-back after filing | alert: re-run `mmail doctor` and re-pin `sent_strategy`; no automatic second filing |
 | Draft delete fails after a successful send | API error | leftover-draft warning in the notification; retried on every reconcile |
 | Draft edited after confirm | message ID mismatch | send is blocked and re-offered; if after send, draft kept |
+| Half-written draft looks settled (you paused, or are offline mid-edit) | not armed (§4.3) | notification offers **Review…** only; no one-tap Send |
 | Gmail app re-uploads a stale offline draft after we deleted it | the same draft content reappears | offered again with a "looks already sent" warning |
 | Gmail Send pressed on a domain thread | `SENT` from `me@gmail.com` in a domain-resolved thread | heads-up push (Android); prevented by guard (web) |
 | Sent copy doesn't thread | E3 / user report | file without `threadId`; still in Sent and search |
