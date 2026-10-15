@@ -576,11 +576,17 @@ Limits:
     dispatch (§4.10).
   - **Expired tokens are refreshed on tap.** A notification can sit untouched for longer
     than 15 minutes. If the embedded token has expired when you tap Send, the service
-    worker uses its device credential to fetch a fresh one for the **same draft version,
-    generation and identity** (`GET /dispatch/{draftId}/token?identity=…`), then posts that.
-    - If the draft or generation changed meanwhile, the server returns the current state
-      and the notification is updated instead. You're never asked to confirm a version you
-      didn't see.
+    worker **sends the expired token itself** to `POST /dispatch/{draftId}/token/refresh`,
+    authenticated with its device credential, then posts the fresh token it gets back.
+    - The server verifies the expired token's signature (ignoring only its expiry). It then
+      compares the token's own `draftMessageId` and generation with the current ones. Only
+      if both match does it mint a fresh token with the same action, target, version,
+      generation and identity.
+    - If either changed meanwhile, for example the draft was edited or an Undo advanced
+      the generation and the replacement push was delayed or dropped, nothing is minted.
+      The server returns the current state and the notification is updated instead.
+      Refreshing a stale notification can never produce a token for content you didn't
+      see.
     - A daily sweep also withdraws notifications for drafts untouched for over 24 hours.
   - Actions:
     - armed drafts: **Send** (posts the token to `/dispatch` in the background, refreshing
@@ -778,6 +784,10 @@ with `draftKept` set.
     (`GET /dispatch/{draftId}/token?identity=…`) when they show the Send button. They fetch
     a new one whenever the dispatch **or the selected identity** changes, so a token is
     only ever minted after the choice is made.
+    - The PWA also passes the `draftMessageId` and generation of the version it's
+      previewing (`&version=…&generation=…`). The server refuses to mint if either is no
+      longer current, so a stale preview can't be confirmed.
+    - The extension's token is for the version it has just saved and is showing (§4.9).
   - Each token binds `draftId`, `draftMessageId`, identity, the current `confirmation`
     generation, a server nonce and an expiry (§4.8).
   - **Each token is bound to one action and its target.** The action is one of `confirm`,
@@ -871,7 +881,10 @@ with `draftKept` set.
         `FILING` with a fresh filing-track schedule (`nextStepAt` = now, next
         `scheduleGen`). It keeps the *original* `filingHistoryId`, so it still reconciles
         before inserting.
-      - **"Close"** resolves the dispatch without a copy (see stored MIME above);
+      - **"Close"** resolves the dispatch without a copy (see stored MIME above). It's
+        refused while delivery work is outstanding: `rejectedRcpts` isn't empty, or an
+        attempt is `SENDING`, `RETRY_WAIT` or `UNCERTAIN`. Retry, dismiss or resolve those
+        first, so Close never deletes the MIME that remaining delivery work needs;
   - **any attempt** that is `UNCERTAIN` and due → re-run the provider-log lookup (§4.6);
   - **any attempt** that is `SENDING` with an expired lease → that attempt becomes
     `UNCERTAIN` and starts polling. This is checked per attempt, **before and independently of** the
