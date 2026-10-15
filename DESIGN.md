@@ -645,15 +645,27 @@ Limits:
   1. make sure the draft is saved (wait for InboxSDK's saved state, then `getDraftID()`);
   2. fetch a confirmation token for the saved draft version **and the identity chosen in
      the dropdown** (`GET /dispatch/{draftId}/token?identity=…`, authenticated with the
-     device token), then `POST /dispatch {token}` (§4.10). The token carries the identity,
-     so there's no separate identity field for the server to trust;
-  3. close the compose view without re-saving.
+     device token). The token carries the identity, so there's no separate identity field
+     for the server to trust;
+  3. **check that the token is for the version on screen.**
+     - If InboxSDK exposes the saved draft's message ID (spike item), the extension passes
+       it as `&version=…`, and the server refuses to mint for any other version.
+     - Otherwise the server returns, with the token, a summary of the version it bound:
+       recipients, subject, the body's first and last lines and the attachment count. The
+       extension compares that with the compose view's current fields.
+     - On any mismatch (e.g. another device or an autosave changed the draft between the
+       save and the token), it doesn't post. It shows "Draft changed elsewhere — review"
+       instead;
+  4. `POST /dispatch {token}` (§4.10);
+  5. close the compose view without re-saving.
 - **Guard.** On `presending`, if the thread resolves to a domain identity, call
   `event.cancel()` and show the choice dialog (§2.3) (doc for `presending`/`cancel`).
 - **Pairing:** the extension gets a device token from the PWA via a one-time code, kept in
   `chrome.storage.local`. The extension never holds Gmail OAuth tokens.
 - **Spike items:**
   - whether the InboxSDK draft ID equals the API draft ID (E3);
+  - whether InboxSDK exposes the saved draft's message ID, which lets the token request
+    name the version directly (step 3);
   - how to force or await a save;
   - closing without resurrecting the deleted draft.
 - **Prior art:** Plume, an alpha extension that hands drafts to a local SMTP helper.
@@ -827,6 +839,18 @@ with `draftKept` set.
   - An edited draft is a **new version**. It's offered afresh, with a "Draft changed —
     review" notification, and gets its own dispatch (keyed by the new message ID) only when
     you confirm it.
+  - **Except after delivery.** If any dispatch for the same `draftId` has accepted
+    recipients, a new version is never a plain new offer. That covers a `SENT_PARTIAL`
+    dispatch whose draft you edited before filing deleted it, and a kept draft
+    (`DONE_KEPT_DRAFT`). Sending it as a second dispatch would duplicate delivery to
+    everyone already reached.
+    - It's offered **Review-only**, with "Already sent to …" listing the accepted
+      recipients.
+    - Confirming it needs an explicit "Send again anyway". That's a `confirm` token whose
+      target also binds the earlier dispatch's ID and accepted-set hash, so a plain Send
+      token can't do it.
+    - The earlier dispatch stays active, and its filing and rejected-recipient retries
+      continue from its own stored MIME.
 - **Undo window:** confirming commits `CONFIRMED` together with `sendAfter` (now +
   `undo_seconds`) and a `confirmation` number. It then creates a Cloud Task for the
   attempt, named as described below.
@@ -854,13 +878,17 @@ with `draftKept` set.
     - The PWA also passes the `draftMessageId` and generation of the version it's
       previewing (`&version=…&generation=…`). The server refuses to mint if either is no
       longer current, so a stale preview can't be confirmed.
-    - The extension's token is for the version it has just saved and is showing (§4.9).
+    - The extension's token is checked against the version it has just saved and is
+      showing, by message ID or by summary (§4.9), before it's posted.
   - Each token binds `draftId`, `draftMessageId`, identity, the current `confirmation`
     generation, a server nonce and an expiry (§4.8).
   - **Each token is bound to one action and its target.** The action is one of `confirm`,
     `undo`, `retry`, `retry-rejected`, `dismiss-rejected`, `resend-uncertain`,
     `mark-delivered`, `abandon`, `retry-filing` or `close`. The target is action-specific:
     - for `undo`, the `confirmation` generation it cancels;
+    - for `confirm` of a new version after an earlier dispatch of the same draft delivered
+      to someone, also that dispatch's ID and accepted-set hash (the explicit "Send again
+      anyway", §4.10 pre-send check);
     - for a retry (including `resend-uncertain`), the attempt number it creates, plus the
       hash of the recipient set for `retry-rejected`;
     - for `dismiss-rejected`, that recipient-set hash **and the latest attempt number**.
