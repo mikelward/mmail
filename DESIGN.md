@@ -284,11 +284,18 @@ attachments and inline `cid:` images, pass through untouched.**
    The Message-ID is generated once per dispatch and persisted *before* submission.
 4. **Keep** `To`, `Cc`, `Subject`, `Reply-To` (if you set one), `In-Reply-To`, `References`,
    `MIME-Version`, `Content-*` and anything else.
-5. **Threading repair.** If `threadId` is set but `In-Reply-To`/`References` are missing (E3a
-   checks whether Gmail drafts carry them):
-   - find the newest non-draft message in the thread;
-   - set `In-Reply-To` to its Message-ID;
-   - set `References` to its References plus its Message-ID.
+5. **Reply or new message?** Gmail gives *every* draft a `threadId`, even a brand-new one.
+   The dispatch is classified as a **reply** only if the thread contains a non-draft parent
+   message; otherwise it is **new**.
+   - **New messages** get no threading headers. Their sent copy is filed **without**
+     `threadId` (§4.7), so Gmail starts a fresh thread. Gmail's threading rules need a
+     parent for `In-Reply-To`/`References`, so filing a new message into its draft thread
+     would fail after the mail had already gone out.
+   - **Threading repair, replies only.** If `In-Reply-To`/`References` are missing (E3a
+     checks whether Gmail drafts carry them):
+     - find the newest non-draft message in the thread;
+     - set `In-Reply-To` to its Message-ID;
+     - set `References` to its References plus its Message-ID.
 6. **Envelope:**
    - `MAIL FROM` is the identity address. The provider rewrites Return-Path to its bounce
      domain or our custom return-path CNAME.
@@ -367,11 +374,13 @@ unknown. The alternate email on the Google account (OPTIONS.md R6) may be enough
 #### Filing strategies
 
 Ranked by preference. Each one gets tested in E3b, now while `me@example.net` is still a
-Send-as alias **and again after the January cutover**.
+Send-as alias **and again after the January cutover**. Wherever a strategy passes
+`threadId`, it does so only for **replies** (§4.5 step 5). New messages are always filed
+without one.
 
 | # | Method | Gets `SENT`? | Keeps true From? | Threads? | Cost / risk |
 |---|---|---|---|---|---|
-| **S1** | `messages.insert` with `labelIds: [SENT]`, `threadId`, `internalDateSource=dateHeader` | Docs say `SENT` is auto-applied only when From is the user's address. Explicit `SENT` on insert is common practice but unverified for a non-alias From. | ✓ | ✓ via `threadId` | `gmail.insert` only |
+| **S1** | `messages.insert` with `labelIds: [SENT]`, `threadId` (replies only), `internalDateSource=dateHeader` | Docs say `SENT` is auto-applied only when From is the user's address. Explicit `SENT` on insert is common practice but unverified for a non-alias From. | ✓ | ✓ via `threadId` | `gmail.insert` only |
 | **S2** | `messages.import`, same labels, `neverMarkSpam=true`, `processForCalendar=false` | GYB restores sent mail by passing `SENT` on import (reported; those copies have your own From) | ✓ | ✓ | Same scope. Runs Gmail's classifier. |
 | **S3** | IMAP `APPEND` to `[Gmail]/Sent Mail` | ✓ This is how Thunderbird and FairEmail file external-SMTP sends | ✓ | by headers only (no `threadId`) | Needs an app password (full mailbox access) or the `mail.google.com` scope; a second auth path |
 | **S4** | `messages.insert` with From rewritten to `me@gmail.com`, plus `X-Mmail-Sent-As: me@example.net` and label `mmail/as/me@example.net` | ✓ (documented auto-apply) | ✗ the archive shows the Gmail address | ✓ | Your archive differs from what recipients saw. The header and label keep the truth and let identity resolution (§4.4) find it. |
@@ -446,7 +455,10 @@ Safeguards (OPTIONS.md R7):
 
 - opt-in, with a dry-run mode that only reports what it would do;
 - matches only that narrow pattern;
-- idempotent: it skips any Message-ID that already has a `SENT` copy;
+- idempotent and resumable. If a verified `SENT` copy with the same Message-ID already
+  exists in the same thread (e.g. a run crashed after re-filing but before trashing), it
+  doesn't re-file. It **resumes the remaining steps**: trash the misfiled original, then
+  label and log. Nothing is skipped, so no duplicate is left behind;
 - runs under its **own** OAuth grant with `gmail.modify`, so the dispatcher keeps its narrow
   scopes;
 - if Gmail ever starts filing the copies correctly, it finds nothing and does nothing.
@@ -597,7 +609,9 @@ Firestore (Native mode), single user:
   - body bytes are identical before and after the transform;
   - the envelope equals the parsed To ∪ Cc ∪ Bcc;
   - the outbound copy carries no `Bcc` or `X-Gm-*`;
-  - the sent copy keeps `Bcc`.
+  - the sent copy keeps `Bcc`;
+  - a brand-new draft (no non-draft parent) is classified as new and filed without
+    `threadId`, while a reply keeps its `threadId` and threading headers.
 - **Integration**, with a second throwaway Gmail account and a test recipient mailbox:
   - DKIM/DMARC pass at the recipient;
   - recipient-side threading;
