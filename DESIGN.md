@@ -568,7 +568,8 @@ Limits:
 - **Compose button.** Add **Send as ▾** to each compose view, preselected via
   `GET /identity?threadId=…`. On click:
   1. make sure the draft is saved (wait for InboxSDK's saved state, then `getDraftID()`);
-  2. `POST /dispatch {draftId, identity}` with the device token;
+  2. fetch a confirmation token for the saved draft version (`GET /dispatch/{draftId}/token`,
+     authenticated with the device token), then `POST /dispatch {token, identity}` (§4.10);
   3. close the compose view without re-saving.
 - **Guard.** On `presending`, if the thread resolves to a domain identity, call
   `event.cancel()` and show the choice dialog (§2.3) (doc for `presending`/`cancel`).
