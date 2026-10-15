@@ -413,6 +413,18 @@ attachments and inline `cid:` images, pass through untouched.**
       once the provider's log retention has passed. The attempt is then parked with no
       `nextStepAt`, and only you can resolve it. Polling only ever reads the log; it never
       resubmits.
+    - **You can resolve it at any time,** while it's polling or parked, with one of three
+      one-time token actions bound to that attempt (§4.10). Each ends its polling in the same
+      transaction:
+      - **"It arrived"** (`mark-delivered`): you've confirmed delivery yourself. The
+        attempt resolves as `SENT` for its whole envelope, marked `userConfirmed`. On a
+        first attempt, filing and draft deletion then run as for any `SENT`. On a
+        rejected-only retry, those recipients leave `rejectedRcpts`.
+      - **"Give up"** (`abandon`): nothing is resent, and the attempt becomes terminal
+        `ABANDONED`. On a first attempt, the dispatch's delivery becomes `ABANDONED`: no
+        Sent copy is filed, the draft is kept as your only record, and the dispatch is
+        resolved. On a rejected-only retry, its recipients move to `dismissedRcpts`.
+      - **"Resend anyway"** (`resend-uncertain`): see §4.10. It may duplicate.
 - **DNS:** unchanged from today's Send-as setup: provider DKIM, and SPF or a custom
   return-path. Once mmail is the only outbound path, consider moving DMARC to `p=quarantine`.
 - **Provider limits:** smtp2go free is 1,000/month and 200/day (25/hour until the domain is
@@ -599,9 +611,10 @@ Limits:
 ### 4.10 Dispatch state machine
 
 The diagram shows the common path as one line. In storage (§5), a dispatch's **delivery
-status** (`CONFIRMED` … `SENT` / `SENT_PARTIAL` / `FAILED` / `UNCERTAIN`) and its **filing
-status** (`PENDING` / `FILING` / `FILED` / `DONE` / `UNFILED`) are separate fields. That
-way, filing a copy and deleting the draft never erase a pending partial-delivery decision.
+status** (`CONFIRMED` … `SENT` / `SENT_PARTIAL` / `FAILED` / `UNCERTAIN` / `ABANDONED`)
+and its **filing status** (`PENDING` / `FILING` / `FILED` / `DONE` / `UNFILED`) are
+separate fields. That way, filing a copy and deleting the draft never erase a pending
+partial-delivery decision.
 
 ```
 OFFERED ──confirm──► CONFIRMED ──undo window──► SENDING ──2xx──► SENT ──insert──► FILED ──delete──► DONE
@@ -638,7 +651,8 @@ with `draftKept` set.
       status** (`FILING`, `FILED`, `DONE` or `UNFILED`). It never files a copy itself: the
       Sent copy is the filing track's job, and a filed one is reused;
     - after `UNCERTAIN`: **never automatically**. Only your explicit "I've checked, resend
-      anyway", which warns that it may duplicate.
+      anyway", which warns that it may duplicate. "It arrived" and "Give up" (§4.6) resolve
+      it without resending.
 
     Every attempt submits the stored outbound MIME (below), with the same body and the same
     Message-ID. Only the `X-Mmail-Attempt` header differs, so the provider log can tell
@@ -682,15 +696,25 @@ with `draftKept` set.
     without touching the filed Sent copy.
   - **"Dismiss"** (`dismiss-rejected`, bound to the current rejected-set hash) moves the
     outstanding rejected recipients to `dismissedRcpts`.
-    - It's refused while an attempt is `SENDING` or `RETRY_WAIT`.
+    - It's refused while any attempt is unresolved (`SENDING`, `RETRY_WAIT` or
+      `UNCERTAIN`). An uncertain retry to those recipients is resolved first, by the
+      attempt's own actions (§4.6). Its "Give up" dismisses them as part of the same
+      transaction and stops its polling, so no late provider result can land on a resolved
+      dispatch.
     - Delivery stays `SENT_PARTIAL`, since that's still the truth, but nothing remains
       outstanding.
     - If the rejected set has changed since the token was minted, e.g. a retry landed in
       between, the hash no longer matches and you're shown the new state.
-  - The dispatch counts as resolved, so its stored MIME can be deleted, only when filing is
-    `DONE` *and* no rejected recipient is outstanding (`rejectedRcpts` is empty, because each
-    was either retried successfully or dismissed). Whichever of filing `DONE`, a successful retry or a dismissal comes last
-    resolves it: its stored MIME is deleted and the unresolved-dispatch alerts stop.
+  - The dispatch counts as resolved, so its stored MIME can be deleted, only when:
+    - filing is `DONE`;
+    - no rejected recipient is outstanding: `rejectedRcpts` is empty, because each was
+      retried successfully or dismissed;
+    - **no attempt is unresolved** (`SENDING`, `RETRY_WAIT` or `UNCERTAIN`).
+
+    The resolution happens on whichever qualifying transition comes last (filing `DONE`, a
+    successful retry, a dismissal, or an uncertain attempt's resolution). Its stored MIME is
+    then deleted and the unresolved-dispatch alerts stop. A first attempt that ends
+    `ABANDONED` is resolved outright.
 - **Write-ahead:** `SENDING`, with the outbound Message-ID, is committed before submission,
   and `SENT` right after the 2xx. The only window where the outcome is unknown is between
   those two commits, and it always resolves to `UNCERTAIN`. So "never send twice" (G5) holds
@@ -746,13 +770,15 @@ with `draftKept` set.
     generation, a server nonce and an expiry (§4.8).
   - **Each token is bound to one action and its target.** The action is one of `confirm`,
     `undo`, `retry`, `retry-rejected`, `dismiss-rejected`, `resend-uncertain`,
-    `retry-filing` or `close`. The target is action-specific:
+    `mark-delivered`, `abandon`, `retry-filing` or `close`. The target is action-specific:
     - for `undo`, the `confirmation` generation it cancels;
-    - for a retry, the attempt number it creates, plus the hash of the recipient set for
-      `retry-rejected`;
-    - for `dismiss-rejected`, that recipient-set hash. The server stores the action and target with the
-    nonce, and each endpoint accepts only tokens for its own action and the current
-    target. A mismatch is rejected without consuming the nonce. So when "Retry filing" and
+    - for a retry (including `resend-uncertain`), the attempt number it creates, plus the
+      hash of the recipient set for `retry-rejected`;
+    - for `dismiss-rejected`, that recipient-set hash;
+    - for `mark-delivered` and `abandon`, the `UNCERTAIN` attempt they resolve.
+
+    The server stores the action and target with the nonce, and each endpoint accepts only
+    tokens for its own action and the current target. A mismatch is rejected without consuming the nonce. So when "Retry filing" and
     "retry rejected only" are both on offer, neither token can authorize the other.
   - **The server mints a token only for an identity the resolver could produce** (§4.4):
     a listed identity, or any address at the `catch_all` domain, such as
@@ -978,7 +1004,7 @@ or addresses.
 | `historyId` too old (404) | API error | full resync from `drafts.list` |
 | Refresh token revoked (password change) | token refresh fails | health alert via Web Push; re-auth link in PWA; Gmail's own Send still works |
 | Provider down or rejecting before `DATA` | connection error, 4xx/5xx at `MAIL`/`RCPT` | automatic retries with backoff (attempt parked in `RETRY_WAIT`, lease released), then `FAILED`; draft kept; "Retry" / "Retry via secondary provider" start the next attempt of the same dispatch from the stored MIME, with no edit needed |
-| Timeout after DATA | socket error | `UNCERTAIN`; never auto-retried; user checks recipient/provider log |
+| Timeout after DATA | socket error | `UNCERTAIN`; never auto-retried; provider log polled; you resolve it with "It arrived", "Give up" or "Resend anyway" (§4.6) |
 | Process dies mid-submission (the provider may have accepted) | `SENDING` lease expires with no result | `UNCERTAIN`; resolved from the provider's send log only by a record **uniquely attributable to the current attempt** (its `X-Mmail-Attempt` marker or provider tag, never Message-ID alone) that gives per-recipient results for that attempt's whole envelope (→ `SENT` or `SENT_PARTIAL`); otherwise you decide; never resent automatically |
 | Insert fails, or its outcome is unknown (lost response, crash before `FILED`) | API error or a dispatch left in `FILING` | reconcile by `X-Mmail-Dispatch` (thread or history since the recorded `historyId`) before any retry (§4.10); then retry with backoff → filing `UNFILED` (`SENT_UNFILED`) + alert; "Retry filing" reactivates it; mail *was* sent |
 | Copy filed but without `SENT` (Gmail behaviour changed, e.g. at the January cutover) | label read-back after filing | alert: re-run `mmail doctor` and re-pin `sent_strategy`; no automatic second filing |
