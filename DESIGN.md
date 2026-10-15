@@ -543,11 +543,19 @@ Limits:
     first and last lines, and the attachment count. For **armed** drafts only (§4.3), it also
     carries a signed **action token**:
     `HMAC(key, draftId | draftMessageId | identity | generation | confirmationId | expiry)`,
-    valid for 15 minutes and usable once (§4.10). Replaying
-    it only ever returns the same dispatch (§4.10).
+    valid for 15 minutes and usable once (§4.10). Replaying it only ever returns the same
+    dispatch (§4.10).
+  - **Expired tokens are refreshed on tap.** A notification can sit untouched for longer
+    than 15 minutes. If the embedded token has expired when you tap Send, the service
+    worker uses its device credential to fetch a fresh one for the **same draft version and
+    generation** (`GET /dispatch/{draftId}/token`), then posts that.
+    - If the draft or generation changed meanwhile, the server returns the current state
+      and the notification is updated instead. You're never asked to confirm a version you
+      didn't see.
+    - A daily sweep also withdraws notifications for drafts untouched for over 24 hours.
   - Actions:
-    - armed drafts: **Send** (posts the token to `/dispatch` in the background) and
-      **Review…** (opens the PWA);
+    - armed drafts: **Send** (posts the token to `/dispatch` in the background, refreshing
+      it first if expired) and **Review…** (opens the PWA);
     - unarmed drafts: **Review…** only.
 
     Android shows two action buttons comfortably.

@@ -93,9 +93,17 @@ These are the point of the design.
      object storage *before* Postfix answers `250 OK`.
      - Each entry gets a **server-generated journal ID** (a UUID), stored with the entry and
        added as an `X-Mmail-Journal-Id` header.
+     - The entry is written as **`staged`**. Only after Postfix has committed the message
+       to its queue and answered the proxy `250` does the proxy mark it **`accepted`**, and
+       only then does it pass the `250` on to the sender.
+       - If Postfix refuses or fails, or the connection drops before that, the staged entry
+         is **discarded**. The sender never got a `250` and will retry, so replaying it
+         would duplicate.
+       - Staged entries left behind by a crash are discarded on recovery for the same
+         reason.
      - When the Gmail delivery agent gets a success from `messages.import`, it records an
        **acknowledgement** for that journal ID.
-     - After an unrecoverable loss, replay re-delivers **every entry without an
+     - After an unrecoverable loss, replay re-delivers **every `accepted` entry without an
        acknowledgement**. It never de-duplicates by `Message-ID`, which senders supply, may
        omit, and may reuse.
      - That makes replay at-least-once. A message delivered but not yet acknowledged may
