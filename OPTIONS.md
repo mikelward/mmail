@@ -13,11 +13,12 @@ build-it-ourselves path in detail.
 - **Not changing:** inbound forwarding into Gmail, IMAP/POP/Gmail API access, "Send as" for
   Google-hosted identities (other Gmail addresses, Google Workspace addresses), and
   third-party IMAP/SMTP accounts inside the Gmail Android/iOS apps.
-- **Most promising, cheapest to test:** host the custom domain's *identity* on a Google
-  Workspace Business Starter seat (~$84/yr) and keep it as a Send-as address in consumer
-  Gmail. Google's wording ("Google-hosted identities") suggests this keeps working. Nobody
-  has confirmed it. A free 14-day trial settles it.
-- **Best build-our-own path if that fails:** a small personal service, "mmail Outbox".
+- **Ruled out: Google Workspace for the domain.** Gmail still allows Send-as for Workspace
+  addresses, but a Google account for `me@example.net` would take over that address across
+  Google. Calendar invites and Drive shares sent to it would go there instead of to your main
+  account. People would share with both, and you'd end up with two half-accounts (R6,
+  Option 1).
+- **Recommended: build a small personal service, "mmail Outbox".**
   You keep composing in the Gmail apps, including Gemini, but instead of pressing Gmail's
   *Send* you leave the draft and tap a notification such as "Send as me@example.net". The
   service sends the draft through smtp2go or forwardemail and files a Sent copy back into the
@@ -80,12 +81,8 @@ The general Send-as help page ([22370][g-22370]) now carries the same banner. It
 that a bounced Send-as address "must be deleted and added again" to re-verify, which is
 another reason not to touch the existing setup until the cutover.
 
-Not covered by the article (open questions, §8):
-
-- How Gmail decides an address is "Google-hosted": by Workspace account, by MX, or by SMTP
-  host.
-- Whether the *Reply-To* setting on the primary address survives. It probably does: it is a
-  property of `me@gmail.com`, not a third-party Send-as.
+Not covered by the article: whether the *Reply-To* setting on the primary address survives
+(§8). It probably does: it is a property of `me@gmail.com`, not a third-party Send-as.
 
 Context: Forward Email has already changed its "Send Mail As using Gmail" FAQ to say the
 setup is deprecated and to point users at its webmail and apps ([FE FAQ][fe-faq])
@@ -105,6 +102,11 @@ Must:
 - **R5** One interface for home and work. Work is Google Workspace Gmail, and work policy
   usually rules out third-party clients on work mail. **In practice the shared interface has
   to be the Gmail apps themselves.**
+- **R6** One Google identity. Calendar invites and Drive/Docs shares addressed to
+  `me@example.net` must keep reaching the consumer account (e.g. through its alternate
+  email). No other Google account, Workspace tenant or Cloud Identity tenant may own the
+  address or the domain. Otherwise people share with two "you"s and the Google identity
+  splits.
 
 Should:
 
@@ -189,45 +191,28 @@ The domain sends go through whichever exception path is cheapest: Forward Email 
 FairEmail, Thunderbird, or the mmail Outbox. This limits dilution to new and casual contacts
 while keeping the important relationships on the domain.
 
-### Option 1 — Make the domain a Google-hosted identity (Workspace)
+### Option 1 — Make the domain a Google-hosted identity (Workspace): rejected
 
-**1a. A Workspace seat used only for identity; consumer Gmail sends as it.** Buy one
-Business Starter seat for `example.net` and create user `me@example.net`, with other
-addresses as free aliases (up to 30). In consumer Gmail, add `me@example.net` as a Send-as
-address over `smtp.gmail.com:587`, authenticated as the Workspace user with an app password.
+Google keeps "Send as" for Google-hosted identities, so the obvious moves were:
 
-- **Inbound:** unchanged at Forward Email. If Google turns out to key on MX, move MX to
-  Workspace and auto-forward or route into `me@gmail.com`.
-- **Day to day:** identical to today on Android and web: the From picker, Gemini, threads, Sent.
-- **Pros:** zero UX change, zero code, Google-supported transport. Outbound is DKIM-signed by
-  Workspace for `example.net`.
-- **Cons:**
-  - ~$84/yr ($7/mo annual; $8.40 flexible; a $5.60 promo was reported for Oct 2026–Jan 2027)
-    (reported).
-  - **Not confirmed to work.** Google never says how "Google-hosted" is decided, and
-    HN commenters disagree (untested).
-  - Google could tighten the rule later.
-  - App passwords require 2-Step Verification on the Workspace user, and Google labels them
-    "not recommended". Workspace legacy password sign-in already ended in March 2025 (doc).
-- **Cost of finding out:** a 14-day trial and one Send-as add (§7, E1). A successful *new*
-  add during the "restrict new configurations" period is strong evidence.
+- **1a.** One Workspace Business Starter seat (~$84/yr) for `me@example.net`, added as a
+  Send-as address in consumer Gmail over `smtp.gmail.com`. Whether consumer → Workspace
+  Send-as is meant to survive is unconfirmed either way.
+- **1b.** Move home mail into that Workspace account, which is Google's own suggestion for
+  custom domains.
 
-**1b. Move home mail into the Workspace account.** Make `me@example.net` a full Workspace
-mailbox and use it as a second Google account in the Gmail app and web (multi-login).
+**Both violate R6.** A Google account that owns `me@example.net` takes over that address
+across Google, even if it is only used for sending:
 
-- **Pros:** the native Gmail UI everywhere; Gemini in Gmail is included in Business Starter
-  (doc).
-- **Cons:**
-  - Violates R1: the store moves.
-  - Google's import tool moves mail but not Calendar, Contacts or Drive.
-  - Photos, Play, Google One storage and the Google identity stay on `me@gmail.com`, and
-    accounts can't be merged.
-  - Two home inboxes unless `me@gmail.com` forwards in.
+- Calendar invitations and Drive/Docs shares addressed to `me@example.net` resolve to the
+  Workspace account, not `me@gmail.com`.
+- Collaborators see two "you"s and share with whichever they picked, so over time you have
+  two half-accounts.
+- 1b additionally moves the store (R1), and Photos, Play and Google One can't follow.
 
-  Not preferred; listed because it is Google's own suggested path.
-
-Cheaper Google products don't help: Cloud Identity Free and Essentials Starter have no Gmail,
-so there is no mailbox to authenticate to `smtp.gmail.com` (doc/reported).
+The same applies to anything else that registers the domain with Google as an organisation
+(Cloud Identity Free, Workspace Essentials). **Don't verify `example.net` with Google
+Workspace or Cloud Identity at all**, not even for a trial.
 
 ### Option 2 — mmail Outbox: compose in Gmail, dispatch externally (build)
 
@@ -415,7 +400,6 @@ them, ranked roughly by how close they stay to today.
 
 | # | Workflow | Android | Desktop web | Extra effort per domain email | Built from |
 |---|---|---|---|---|---|
-| A | **Nothing changes** | Gmail app, pick From | Gmail web, pick From | 0 | 1a |
 | B | **Draft then dispatch** | Gmail app → back → tap notification | Gmail web → "Send as" button | +1 tap | 2 (+5a) |
 | C | **Reply via relay** | Gmail app, normal Reply/Send | Gmail web, normal Reply/Send | 0 for replies; encoded address for new contacts | 3a or 3b |
 | D | **Two-account Gmail app** | Gmail app, switch From to the IMAP identity | Thunderbird or Forward Email webmail for domain sends | +2 taps on Android; another app on desktop | 4 (+7) |
@@ -434,7 +418,9 @@ Notes:
 - **Any workflow can be phased:**
   - **Now → January:** today's Send-as, frozen.
   - **January → whenever B ships:** E or D.
-  - **Then:** B (or A if E1 passes).
+  - **Then:** B.
+- **There is no "nothing changes" workflow.** The only way to keep today's exact UX was a
+  Google-hosted identity (Option 1), which splits your Google account.
 
 ## 5. Comparison
 
@@ -444,8 +430,8 @@ Notes:
 |---|---|---|---|---|---|---|---|---|---|
 | 0 @gmail.com | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | none | $0 | none (but identity cost) |
 | 0b Hybrid | ~ | ~ | ~ | ✓ | ✓ | ✓ | none | $0 | low |
-| 1a Workspace identity | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | none | ~$84/yr | **unknown until E1**; Google policy |
-| 1b Move to Workspace | ✓ | ✓ | ✓ | ✗ | ~ | ✓ | migration | ~$84/yr | low |
+| 1a Workspace identity | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | none | ~$84/yr | **rejected: splits Google identity (R6)** |
+| 1b Move to Workspace | ✓ | ✓ | ✓ | ✗ | ~ | ✓ | migration | ~$84/yr | **rejected: splits Google identity (R6)** |
 | 2 mmail Outbox | ~ (+1 tap) | ✓ (with ext) | ✓ | ✓ | ✓ | ✓ | medium | ~$0 | medium (our service, API quirks) |
 | 3a Relay, bought | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | none | $30–36/yr | medium (vendor; leaks) |
 | 3b Relay, built | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | medium–high | ~$0 | medium–high |
@@ -466,56 +452,51 @@ Notes:
 2. **E0 — inventory** (§7). Find out how much mail actually goes out as the domain, to whom,
    and which recipients are sender-matched systems. This decides how much Option 0's
    downsides really bite.
-3. **E1 — Workspace identity test.** Free trial; one afternoon.
-4. **E2 — Gmail app IMAP identity test.** 15 minutes.
-5. If you can reach the Gmail team (the internal draft link suggests you might), ask one
-   question: *how is "Google-hosted identity" determined — Workspace account, MX, or
-   `smtp.gmail.com` as the SMTP host — and is consumer Gmail sending as a Workspace-hosted
-   custom domain intended to keep working?*
+3. **E2 — Gmail app IMAP identity test.** 15 minutes. If it passes, it's the interim
+   Android path, with no code.
+4. **E3 — Gmail API spikes.** One or two evenings, to de-risk Option 2 before building it.
 
 **Then:**
 
 ```
-E1 passes (and Google confirms or stays silent)?
-├─ yes → Option 1a. Done; keep DESIGN.md as the contingency plan.
-└─ no
-   ├─ Build mmail Outbox (Option 2), Android first, web extension second.
-   │    Interim until it ships: E2 if it passed, else FairEmail (Android)
-   │    and Thunderbird (desktop) for domain sends — workflow D or E.
-   ├─ Want zero-tap replies too? Trial addy.io Pro (3a) on a subdomain or
-   │    a secondary address first. If the inbound trade-offs are OK, add it,
-   │    or build 3b later.
-   └─ Don't want to run anything? Workflow E (hybrid) or F (Reply-To).
+Build mmail Outbox (Option 2): Android first, web extension second.
+│   Interim until it ships, and fallback if it slips past January:
+│   E2 if it passed, else FairEmail (Android) + Thunderbird (desktop)
+│   for domain sends — workflow D or E.
+├─ Want zero-tap replies too? Trial addy.io Pro (3a) on a subdomain or a
+│   secondary address (E4). If the inbound trade-offs are OK, adopt it,
+│   or build 3b later.
+└─ Decide not to run anything? Workflow E (hybrid) or F (Reply-To), using
+    the E0 inventory to update the services that check your sender address.
 ```
 
-**Why this order.** 1a costs about $7/month and zero engineering, so it is worth ruling in or
-out first. Option 2 is the best thing we can build: it keeps Gmail as both store and UI,
-leaves inbound mail untouched, and puts the only friction (one tap) where it's visible and
-controllable. A relay is the only way to get *zero* friction, but it changes how every inbound
-message looks. It should be tried before it's trusted with the primary address.
+**Why this order.** With Workspace ruled out (R6), nothing Google-native keeps the domain as
+a sending identity without splitting the Google account. Option 2 is the best thing we can
+build: it keeps Gmail as both store and UI, leaves inbound mail untouched, and puts the only
+friction (one tap) where it's visible and controllable. A relay is the only way to get *zero*
+friction, but it changes how every inbound message looks. It should be tried before it's
+trusted with the primary address.
 
 ## 7. Experiments to run before January 2027
 
 | ID | Experiment | Steps | Pass criteria |
 |---|---|---|---|
 | **E0** | Inventory of domain sending | Google Takeout → Mail → only the *Sent* label (mbox), then a local script (no OAuth needed). Alternatively Gmail search `in:sent from:(*@example.net)`. Count messages and recipients per domain over 1/3/10 years; flag helpdesk domains (zendesk.com, freshdesk.com, helpscoutapp.com, service-now.com, atlassian.net…), list traffic (List-Id on received mail) and ingest addresses. | A CSV of "who knows me only as @example.net" and "who checks my sender address". |
-| **E1** | Consumer → Workspace Send-as | Start a Business Starter trial for `example.net` (domain verification by TXT; leave MX alone). Create `me@example.net`, enable 2SV, create an app password. In consumer Gmail add Send-as `me@example.net` via `smtp.gmail.com:587`. Compare: also try adding a *non-Google* test address (e.g. `test@example.org` via smtp2go) to see if new third-party adds are already blocked. | Workspace add accepted while the third-party add is refused or warned → strong signal. Mail arrives DKIM `d=example.net` pass. Shows in the Gmail Android From picker. |
+| ~~E1~~ | ~~Consumer → Workspace Send-as~~ | Dropped: Option 1 is rejected (R6). Don't verify the domain with Workspace even for a trial. | — |
 | **E2** | Gmail app IMAP identity | On Android, set up as in Option 4. Reply to a thread in the Google account, switch From, Send. | The app accepts `imap.gmail.com`. The reply is delivered from `me@example.net` with DKIM pass. The sent copy shows in the *same Gmail thread* and in Gmail's Sent (or at least in All Mail under a "Sent" label). |
 | **E3** | Gmail API behaviours (for Option 2) | With a throwaway OAuth client: (a) `drafts.get format=raw` on a reply drafted in the Android app — does it carry In-Reply-To/References? (b) `messages.insert` with `labelIds:[SENT]`, `threadId`, and `From: me@example.net` — does it land in Sent and thread? (c) `watch` with `labelIds:[DRAFT]` — latency after leaving compose on Android; how often web autosave fires. (d) Does smtp2go keep our Message-ID? (e) Does `messages.send` rewrite a non-alias From? | (a)–(d) behave as DESIGN.md assumes; any deviation is noted there. |
 | **E4** | Reverse-alias trial (optional) | addy.io Pro on a subdomain such as `r.example.net`, or on a secondary address; live with it for two weeks. | Spam leakage, Gmail rendering and autocomplete pollution are tolerable. |
 
 ## 8. Open questions
 
-1. How does Gmail decide "Google-hosted"? Does a forwarded-in domain with a Workspace seat
-   count? Does it matter where MX points? (E1, plus asking Google.)
-2. Will the `Reply-To` setting on `me@gmail.com` survive January 2027 (Option 0, workflow F)?
-3. After January, will Gmail still recognise `me@example.net` as "me" in thread display and
+1. Will the `Reply-To` setting on `me@gmail.com` survive January 2027 (Option 0, workflow F)?
+2. After January, will Gmail still recognise `me@example.net` as "me" in thread display and
    in the "to me" search operators once it is no longer a Send-as address? (Cosmetic; affects
-   Option 2's sent copies.)
-4. Will the Gmail Android app keep allowing an "Other" IMAP account that points at
+   Option 2's sent copies.) The alternate email on the Google account (R6) may be enough.
+3. Will the Gmail Android app keep allowing an "Other" IMAP account that points at
    `imap.gmail.com`? (E2; Google could close this.)
-5. App passwords: still offered but "not recommended". If they disappear, Options 1a and 4
-   break, and Option 2 is unaffected (it uses OAuth).
+4. App passwords: still offered but "not recommended". If they disappear, Option 4 breaks;
+   Option 2 is unaffected (it uses OAuth).
 
 ## 9. Sources
 
