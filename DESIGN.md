@@ -681,7 +681,7 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
   changed — review".
 - **Undo window:** confirming commits `CONFIRMED` together with `sendAfter` (now +
   `undo_seconds`) and a `confirmation` number. It then creates a Cloud Task with a
-  **deterministic name** (`dispatchId-confirmation`), so creating it twice is a no-op.
+  name built from the dispatch's state (`dispatchId-confirmation-scheduleGen`, see below).
   - The task handler acts only if the dispatch is still `CONFIRMED` with the same
     `confirmation` number. Stale tasks do nothing.
   - Undo moves the dispatch to `CANCELLED` and deletes the task. If the delete fails, the
@@ -709,9 +709,19 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
   Undo increments the generation. So **reconfirming a `CANCELLED` dispatch needs a token
   the server issued after the cancellation**: the Undo notification's fresh "Send anyway"
   action, or a new tap in a PWA or extension view that has fetched a new token.
-- **Every transition persists its next step.** Each state commit also writes `nextStepAt`.
-  The Cloud Task for that step has a deterministic name (`dispatchId-state-attempt`), so a
-  process can die between the commit and task creation without stranding the dispatch.
+- **Every transition persists its next step.** Each state commit also writes `nextStepAt`,
+  so a process can die between the commit and task creation without stranding the
+  dispatch.
+- **Task names include a scheduling generation.** Each Cloud Task is named
+  `dispatchId-state-attempt-scheduleGen`.
+  - `scheduleGen` is incremented in the same transaction that decides to (re)enqueue.
+  - Cloud Tasks refuses to reuse a deleted or completed task's name for up to ~24 hours.
+    A fixed name could therefore leave a re-enqueue blocked after a task exhausts its
+    retries or is deleted, stalling a `SENT`, `FILING` or `FILED` dispatch, and its
+    sendable draft, for a day.
+  - **Idempotency comes from the transactional guard, not the name.** Every handler
+    checks state, attempt, `confirmation` and `scheduleGen` before acting, and takes the
+    per-dispatch lease. A superseded or duplicate task does nothing.
 - **Recovery sweep** (Cloud Scheduler, every few minutes, in both modes). It enqueues the
   next step for **any non-terminal dispatch whose `nextStepAt` is more than a minute
   overdue**:
@@ -726,7 +736,8 @@ WITHDRAWN           CANCELLED                   FAILED          SENT_UNFILED    
     `SENT_PARTIAL` dispatch whose filing is already `DONE` is still caught, and can't hold
     its lease forever.
 
-  It also raises the unresolved-dispatch alerts. Deterministic task names keep all of this
+  It also raises the unresolved-dispatch alerts. Each re-enqueue bumps `scheduleGen`, so
+  it never collides with a remembered task name, and the handler's guard keeps the effect
   idempotent.
 
 ## 5. Data model
@@ -737,7 +748,7 @@ Firestore (Native mode), single user:
 |---|---|
 | `sync/gmail` | `historyId`, `watchExpiration`, `lastReconcile` |
 | `drafts/{draftId}` | `messageId`, `threadId`, `toSummary`, `subject`, `identity`, `identitySource`, `settledAt`, `notifiedAt`, `silenced` |
-| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `nextStepAt`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
+| `dispatches/{hash(draftId, draftMessageId)}` | `draftId`, `draftMessageId`, `identity`, `outboundMessageId`, `confirmation`, `consumedConfirmationIds`, `sendAfter`, `nextStepAt`, `scheduleGen`, `attempt` (with per-attempt envelope and result), `acceptedRcpts`, `rejectedRcpts`, `mimeObject` (Cloud Storage path of the encrypted outbound MIME, cleared on resolution), `provider`, `providerRef`, `delivery` (delivery status), `filing` (filing status), `filingMode` (`threaded`/`unthreaded`), `error`, `sentCopyId`, `sentStrategy`, `sentLabelsOk`, `filingHistoryId`, timestamps. The ID is the uniqueness guard (§4.10). |
 | `devices/{id}` | push subscription, token hash, name, lastSeen |
 | `config/main` | identities, rules, policy, `settle_seconds`, `undo_seconds`, `sent_strategy`, `archive_on_send` |
 
