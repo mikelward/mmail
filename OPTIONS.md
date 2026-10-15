@@ -225,6 +225,13 @@ The same applies to anything else that registers the domain with Google as an or
 (Cloud Identity Free, Workspace Essentials). **Don't verify `example.net` with Google
 Workspace or Cloud Identity at all**, not even for a trial.
 
+**The single-identity variants don't rescue it either.** You could make Workspace your *only*
+Google account, either by migrating or by converting `me@gmail.com` in place through domain
+verification. But Workspace accounts can't create, join or manage a family group or
+supervise children with Family Link. They also can't have Google One/AI Pro, YouTube Premium,
+Play Pass, Fitbit linking or Android backup, and Gemini is limited and loses Personal
+Intelligence. Full pros and cons: [WORKSPACE.md](WORKSPACE.md).
+
 ### Option 2 — mmail Outbox: compose in Gmail, dispatch externally (build)
 
 The build-our-own option; full design in [DESIGN.md](DESIGN.md).
@@ -380,6 +387,10 @@ Turn on IMAP storage at Forward Email ($3/mo for 10 GB) and add `me@example.net`
   - No web UI inside Gmail.
 
 ### Option 10 — Migrate (not preferred)
+
+What you'd lose by moving mail to another provider (Gemini over mail, Calendar's auto-added
+events, Gmail spam filtering, one web UI), a provider-by-provider table against your criteria,
+and a "Fastmail plus copies into Gmail" hybrid are in [MIGRATE.md](MIGRATE.md).
 
 | Option | Price (2026) | Notes |
 |---|---|---|

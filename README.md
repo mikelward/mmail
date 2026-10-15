@@ -10,6 +10,11 @@ mail through an external provider after Gmail ends third-party "Send as" in Janu
 - [DESIGN.md](DESIGN.md): the design for building our own "mmail Outbox" (compose in Gmail,
   dispatch via smtp2go/Forward Email), its web-only mode, Sent-copy handling, and an
   inventory tool.
+- [WORKSPACE.md](WORKSPACE.md): pros and cons of Google Workspace for personal use, including
+  converting the @gmail.com account. Family groups, Google One and other consumer services
+  don't work on Workspace accounts.
+- [MIGRATE.md](MIGRATE.md): what you lose by moving mail to another provider (Fastmail,
+  Proton, Outlook, iCloud+) against your criteria, plus a hybrid that copies mail into Gmail.
 - [RELAY.md](RELAY.md): exploratory side project. Run our own MX and reverse-alias
   rewriter for zero-tap replies, designed to fail open, with anti-spam, bounces and
   observability. It helps replies only, so it's not the plan.
