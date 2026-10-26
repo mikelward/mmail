@@ -86,7 +86,8 @@ Outbox works in a tab.
 ### 2.4 Sending from @gmail.com as usual
 
 Just press Gmail's Send. The draft disappears, mmail sees the deletion and withdraws its
-notification. Nothing else happens.
+notification. Nothing else happens. If you then tap Gmail's **Undo**, the draft comes back
+and mmail offers it again like any other draft.
 
 ### 2.5 Pressing Gmail's Send on a domain thread by habit
 
@@ -95,6 +96,23 @@ notification. Nothing else happens.
   address in Bcc (an armed draft sent the wrong way). It then pushes a heads-up so you can
   follow up.
 - **Web:** the extension's guard prevents it.
+- **Gmail's Undo Send rarely helps.** Gmail holds what it sends for a short window with an
+  **Undo** button: 5, 10, 20 or 30 seconds on web, set under Settings → General → Undo Send
+  (doc). The Gmail apps have Undo too (doc) but no setting. Reports put the Android window
+  at about 5 seconds, whatever the web setting says (reported).
+  - mmail can't press Undo for you. There's no API for it, and cancelling the pending send
+    by changing the draft through the API would mean working against Gmail's internals
+    (R7).
+  - A heads-up saying "tap Undo in Gmail" works only if it arrives inside the window. That
+    needs the API to show the pending send at the tap (A9). Even then, the chain from
+    Gmail's push through Pub/Sub, Cloud Run and Web Push often takes longer than 5
+    seconds.
+  - If A9 holds, the heads-up can fire as soon as a domain draft vanishes with no mmail
+    dispatch, rather than waiting for `SENT`. It can't tell a send from a discard, so it
+    says "If you just sent this from Gmail, tap Undo".
+  - On web the extension's guard makes this moot. Until it ships, set web Undo Send to 30
+    seconds if A9 holds, and leave it at 5 if it doesn't: a longer window then widens a
+    double-send race (A9).
 
 ## 3. Architecture
 
@@ -246,6 +264,12 @@ Arming signals, explicit and per platform:
     (§2.5).
 - **Opt-in `trust_settle`:** for anyone who accepts the risk, a long settle (e.g. 60 s) counts
   as armed. It's off by default.
+- **Rejected: Gmail's Schedule send.** It's on web, Android and iOS, and cancelling a
+  scheduled email turns it back into a draft (doc), so scheduling could mean "finished".
+  But it fails the wrong way (R7). If mmail is down, Gmail sends it from `me@gmail.com` at
+  the scheduled time. If mmail sends it but can't cancel the scheduled copy, Gmail sends it
+  a second time. The API also doesn't document whether scheduled messages are visible to
+  it at all.
 
 Even an armed draft is re-checked at send time: its message ID must equal the one you saw
 (§4.10). The Send and undo notifications show the body's first and last lines and the
@@ -844,7 +868,9 @@ with `draftKept` set.
     the **terminal** `WITHDRAWN`, and its stored MIME, if any, is deleted. It's keyed to a
     draft version that no longer exists, so nothing could ever confirm it again, and it
     must not sit in a non-terminal state for the sweep to chase. A queued retry can
-    therefore never deliver a message you've already sent from Gmail.
+    therefore never deliver a message you've already sent from Gmail. Both claims depend
+    on Gmail's Undo Send: the draft must vanish when you tap Send (A9), and a vanished
+    version must not come back unchanged (A10).
   - If an attempt is `UNCERTAIN`, only the resend is refused. That attempt stays, for "It
     arrived" or "Give up" (§4.6).
   - An edited draft is a **new version**. It's offered afresh, with a "Draft changed —
@@ -1112,6 +1138,9 @@ or addresses.
     reached `SENT`. Confirm both return the existing dispatch and nothing is resubmitted;
   - send to a mix of valid and rejected recipients. Confirm `SENT_PARTIAL` with the right
     accepted/rejected sets, and that "retry rejected only" reaches just those addresses;
+  - on a draft confirmed in mmail but still inside mmail's undo window, tap Gmail's Send.
+    Confirm it goes out once, from Gmail. Repeat with Gmail's Undo, and confirm the
+    restored draft is offered again and can be sent (A9, A10);
   - drop Pub/Sub messages and confirm reconcile catches up.
 
 ## 8. Security and privacy
@@ -1170,6 +1199,8 @@ or addresses.
 | Half-written draft looks settled (you paused, or are offline mid-edit) | not armed (§4.3) | notification offers **Review…** only; no one-tap Send |
 | Gmail app re-uploads a stale offline draft after we deleted it | the same draft content reappears | offered again with a "looks already sent" warning |
 | Gmail Send pressed on a domain thread | `SENT` from `me@gmail.com` in a domain-resolved thread | heads-up push (Android); prevented by guard (web) |
+| Gmail Send pressed on a draft mmail has confirmed but not yet sent | pre-send check finds the draft gone | `WITHDRAWN`; sent once, from Gmail. Needs the draft to vanish at the tap (A9); otherwise it can go out twice |
+| Gmail Send, then Gmail's Undo | the draft vanishes, then comes back | offered again like any draft; a version that already has a `WITHDRAWN` dispatch needs A10 |
 | Sent copy doesn't thread | E3 / user report | file without `threadId`; still in Sent and search |
 | Server down entirely | health check from outside (e.g. a free uptime monitor) | drafts just wait; Gmail's Send is the manual fallback |
 
@@ -1215,7 +1246,7 @@ still exists.
 
 | Milestone | Target | Contents |
 |---|---|---|
-| **M0** | 2026-10-31 | E0 inventory; E2 Gmail-app IMAP test (the interim Android path); E3 API spikes to check assumptions A1–A7. |
+| **M0** | 2026-10-31 | E0 inventory; E2 Gmail-app IMAP test (the interim Android path); E3 API spikes to check assumptions A1–A10. |
 | **M1** | 2026-11-21 | Prototype: CLI `mmail dispatch <draftId>` + `mmail doctor` (§4.7) + `core` transform + filer, run locally against real drafts; ntfy notification from a polling loop. Verifies threading, sent copy strategy, DKIM. |
 | **M2** | 2026-12-12 | *If E2 failed:* Cloud Run + Pub/Sub + Firestore + Cloud Tasks; PWA with Web Push actions; identity resolver; undo; accidental-send heads-up; health alerts. Daily driver on Android. *If E2 passed:* web-only mode (§3) instead, plus the Sent fixer if E2 showed copies in the wrong label. |
 | **M3** | 2027-01-09 | Gmail web extension (button + guard). Until then, desktop uses Thunderbird, Forward Email webmail, or (full mode) notifications and the PWA. |
@@ -1235,3 +1266,5 @@ Interim fallback for any slippage: FairEmail on Android and Thunderbird on deskt
 | A6 | The InboxSDK draft ID equals the Gmail API draft ID, or can be mapped to it directly. | **The extension never dispatches by heuristic.** Thread, recipients, subject and timing can't prove identity: the clicked draft may not yet be visible to the API while another draft matches exactly. Without a direct ID mapping, the Send-as button opens the PWA's Review screen for that thread, where you see the full content and choose explicitly. The guard against Gmail's own Send still works. |
 | A7 | After January 2027 Gmail still renders our inserted sent copies sensibly even though `me@example.net` is no longer a Send-as alias. | Re-run `mmail doctor`; switch to S4 if "me" or `SENT` breaks. |
 | A8 | Gmail collapses inbound echoes (Cc to yourself, list copies) of a message whose `SENT` copy exists with the same Message-ID. | Echoes show as new mail; mmail flags them. |
+| A9 | When you tap Gmail's Send, on Android and on web, the draft leaves the API and the watch fires at the tap, not when Gmail's Undo Send window closes. | The pre-send check (§4.10) can't see a pending Gmail send. A draft confirmed in mmail and then sent from Gmail while Gmail is still holding it goes out twice, once from each address. Keep web Undo Send at 5 seconds, which narrows that race but doesn't close it; on web the extension's guard closes it. No in-window heads-up (§2.5). |
+| A10 | A draft version that vanishes never comes back with the same message ID, including after Gmail's Send and then Undo. | A version whose dispatch is already `WITHDRAWN` (§4.10) can come back, and can then never be confirmed, because its dispatch ID is taken. Then the dispatch ID needs an appearance counter, kept in `drafts/{draftId}` and bound into tokens, so the restored draft gets a fresh dispatch. A draft that was only offered is just offered again either way. |

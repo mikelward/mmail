@@ -247,7 +247,7 @@ The build-our-own option; full design in [DESIGN.md](DESIGN.md).
   then back (the draft is saved) and tap **Send** on the notification. Without that marker,
   the notification only offers **Review**, which opens the draft before sending. That's two
   taps, so a paused, half-written draft can't go out by accident. There's a short undo
-  window either way.
+  window either way. It's mmail's own: Gmail's Undo Send only delays Gmail's own Send.
 - **Day to day, web:** a "Send as ▾" button next to Gmail's Send, plus a guard that catches
   Gmail's own Send on domain threads.
 - **Pros:**
@@ -259,7 +259,9 @@ The build-our-own option; full design in [DESIGN.md](DESIGN.md).
 - **Cons:**
   - One extra tap.
   - Hitting Gmail's own Send by habit sends from `me@gmail.com`. The web guard prevents
-    this; Android can only warn after the fact.
+    this; Android can only warn after the fact. Gmail's Undo Send lasts about 5 seconds
+    on Android, usually too short for a warning to arrive while you can still undo
+    (DESIGN.md §2.5).
   - You run a small service: Cloud Run plus Pub/Sub, effectively free.
   - Needs a personal OAuth client with restricted scopes, published "In production" but
     unverified, since "Testing" tokens expire after 7 days (doc).
@@ -512,7 +514,7 @@ E0 inventory to update the services that check your sender address.
 | **E0** | Inventory of domain sending | Google Takeout → Mail → only the *Sent* label (mbox), then a local script (no OAuth needed). Alternatively Gmail search `in:sent from:(*@example.net)`. Count messages and recipients per domain over 1/3/10 years; flag helpdesk domains (zendesk.com, freshdesk.com, helpscoutapp.com, service-now.com, atlassian.net…), list traffic (List-Id on received mail) and ingest addresses. | A CSV of "who knows me only as @example.net" and "who checks my sender address". |
 | ~~E1~~ | ~~Consumer → Workspace Send-as~~ | Dropped: Option 1 is rejected (R6). Don't verify the domain with Workspace even for a trial. | — |
 | **E2** | Gmail app IMAP identity | On Android, set up as in Option 4. Reply to a thread in the Google account, switch From, Send. | The app accepts `imap.gmail.com`. The reply is delivered from `me@example.net` with DKIM pass. The sent copy shows in the *same Gmail thread* and in Gmail's Sent. Record exactly where it lands: the real Sent, another label (fixable by the Sent fixer), or nowhere (Option 4 then has no Sent copy). |
-| **E3** | Gmail API behaviours (for Option 2) | With a throwaway OAuth client: (a) `drafts.get format=raw` on a reply drafted in the Android app — does it carry In-Reply-To/References? (b) the Sent filing strategies S1–S5 in DESIGN.md §4.7 (`mmail doctor`): which ones give `SENT`, thread, and show as "me"? Run now and again after the January cutover. (c) the unfiltered `watch` used in production (DESIGN.md §4.2, history filtered locally): latency after leaving compose on Android, and how quickly a sent message and a deleted draft appear in history; how often web autosave fires. (d) Does smtp2go keep our Message-ID? (e) Does `messages.send` rewrite a non-alias From? | (a)–(d) behave as DESIGN.md assumes; any deviation is noted there. |
+| **E3** | Gmail API behaviours (for Option 2) | With a throwaway OAuth client: (a) `drafts.get format=raw` on a reply drafted in the Android app — does it carry In-Reply-To/References? (b) the Sent filing strategies S1–S5 in DESIGN.md §4.7 (`mmail doctor`): which ones give `SENT`, thread, and show as "me"? Run now and again after the January cutover. (c) the unfiltered `watch` used in production (DESIGN.md §4.2, history filtered locally): latency after leaving compose on Android, and how quickly a sent message and a deleted draft appear in history; how often web autosave fires. (d) Does smtp2go keep our Message-ID? (e) Does `messages.send` rewrite a non-alias From? (f) Gmail's Undo Send, on Android and on web: tap Send on a test draft. Does the draft leave `drafts.list` at the tap or when the window closes? When does the `SENT` message appear, and does the watch fire inside the window? After Undo, does the draft come back with the same draft ID and message ID? | (a)–(d) and (f) behave as DESIGN.md assumes (A9 and A10 for (f)); any deviation is noted there. |
 | ~~E4~~ | ~~Reverse-alias trial~~ | Dropped: Option 3 is rejected (R7). | — |
 
 ## 8. Open questions
@@ -545,6 +547,8 @@ Google:
   [threads guide](https://developers.google.com/workspace/gmail/api/guides/threads)
 - [Workspace add-ons on mobile](https://developers.google.com/workspace/add-ons/guides/using-addons)
 - [Gemini in Gmail by edition (13952129)](https://support.google.com/mail/answer/13952129)
+- [Send or unsend Gmail messages (2819488)](https://support.google.com/mail/answer/2819488),
+  [Schedule emails to send (9214606)](https://support.google.com/mail/answer/9214606)
 
 Vendors and projects:
 - [Forward Email FAQ (Send Mail As deprecation, webhooks, API)][fe-faq]
@@ -563,6 +567,10 @@ Discussion:
   [49162481](https://news.ycombinator.com/item?id=49162481),
   [49956092](https://news.ycombinator.com/item?id=49956092)
 - [Proton: Gmail ends Send As for third-party addresses](https://proton.me/blog/gmail-ends-send-as-third-party)
+- Undo Send on mobile (reported):
+  [9to5Google, 2018](https://9to5google.com/2018/08/20/gmail-android-undo-send/),
+  [SupportBee](https://supportbee.com/blog/how-to-unsend-email-in-gmail),
+  [Proton](https://proton.me/blog/how-to-unsend-email-gmail)
 
 [g-17101213]: https://support.google.com/mail/answer/17101213
 [g-22370]: https://support.google.com/mail/answer/22370
