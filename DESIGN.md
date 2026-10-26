@@ -205,6 +205,8 @@ Storage/KMS, Cloud Tasks and Cloud Scheduler.
   a 15k units/min/user limit (doc). The unfiltered watch adds one `history.list` per inbound
   message. One user still won't come close. (Google introduced quota tiers
   in May 2026; re-check the numbers, but personal volume is far below any threshold.)
+- **Other consumers:** the exploratory filter watcher ([FILTERING.md](FILTERING.md) §4)
+  would read new inbound mail from this same feed, under its own token.
 
 ### 4.3 Draft tracker and notification policy
 

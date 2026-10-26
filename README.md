@@ -15,6 +15,10 @@ mail through an external provider after Gmail ends third-party "Send as" in Janu
   don't work on Workspace accounts.
 - [MIGRATE.md](MIGRATE.md): what you lose by moving mail to another provider (Fastmail,
   Proton, Outlook, iCloud+) against your criteria, plus a hybrid that copies mail into Gmail.
+- [FILTERING.md](FILTERING.md): exploratory. Better filtering on top of Gmail: native filters
+  as code (gmailctl), catch-all aliases routed to plus addresses, a post-delivery watcher on
+  mmail's change feed, and political mail as the worked example. Personal use needs no
+  Google review.
 - [RELAY.md](RELAY.md): exploratory side project. Run our own MX and reverse-alias
   rewriter for zero-tap replies, designed to fail open, with anti-spam, bounces and
   observability. It helps replies only, so it's not the plan.
